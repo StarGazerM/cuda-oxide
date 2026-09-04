@@ -3010,7 +3010,7 @@ fn passthrough_command_accepts_empty_cargo_args() {
 }
 
 #[test]
-fn architecture_and_output_mode_do_not_change_global_rustflags() {
+fn architecture_changes_global_rustflags_and_output_mode_does_not() {
     let ctx = test_context(OxideConfig::default());
     let base = CargoPassthroughOptions {
         verbose: false,
@@ -3028,12 +3028,22 @@ fn architecture_and_output_mode_do_not_change_global_rustflags() {
     };
     let base_cmd =
         passthrough_command_for_test(&ctx, CargoPassthroughSubcommand::Build, &base, &[]).unwrap();
-    let different_mode = CargoPassthroughOptions {
-        emit_nvvm_ir: true,
+    let different_arch = CargoPassthroughOptions {
         arch: Some("sm_90"),
         ..base
     };
-    let different_cmd = passthrough_command_for_test(
+    let arch_cmd = passthrough_command_for_test(
+        &ctx,
+        CargoPassthroughSubcommand::Build,
+        &different_arch,
+        &[],
+    )
+    .unwrap();
+    let different_mode = CargoPassthroughOptions {
+        emit_nvvm_ir: true,
+        ..different_arch
+    };
+    let mode_cmd = passthrough_command_for_test(
         &ctx,
         CargoPassthroughSubcommand::Build,
         &different_mode,
@@ -3041,14 +3051,19 @@ fn architecture_and_output_mode_do_not_change_global_rustflags() {
     )
     .unwrap();
 
-    assert_eq!(
+    assert_ne!(
         command_env(&base_cmd, "CARGO_ENCODED_RUSTFLAGS"),
-        command_env(&different_cmd, "CARGO_ENCODED_RUSTFLAGS"),
-        "architecture/output switches must not invalidate every dependency"
+        command_env(&arch_cmd, "CARGO_ENCODED_RUSTFLAGS"),
+        "the target architecture cfg is visible to ordinary Rust source"
+    );
+    assert_eq!(
+        command_env(&arch_cmd, "CARGO_ENCODED_RUSTFLAGS"),
+        command_env(&mode_cmd, "CARGO_ENCODED_RUSTFLAGS"),
+        "output materialization does not change compiler flags"
     );
     assert_ne!(
         command_env(&base_cmd, CODEGEN_FINGERPRINT_ENV),
-        command_env(&different_cmd, CODEGEN_FINGERPRINT_ENV),
+        command_env(&mode_cmd, CODEGEN_FINGERPRINT_ENV),
         "device owners still need a distinct Cargo identity"
     );
 }
@@ -3907,7 +3922,43 @@ fn apply_output_mode_sets_target_for_arch_override() {
         command_env(&cmd, "CUDA_OXIDE_TARGET").as_deref(),
         Some("sm_120")
     );
+    assert_eq!(
+        decoded_rustflags(&command_env(&cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap()),
+        [
+            "--check-cfg=cfg(cuda_arch,values(any()))",
+            "--check-cfg=cfg(cuda_arch_ge_80)",
+            "--check-cfg=cfg(cuda_arch_ge_90)",
+            "--check-cfg=cfg(cuda_arch_ge_100)",
+            "--cfg",
+            "cuda_arch=\"sm_120\"",
+            "--cfg",
+            "cuda_arch_ge_80",
+            "--cfg",
+            "cuda_arch_ge_90",
+            "--cfg",
+            "cuda_arch_ge_100",
+        ]
+    );
     assert_eq!(command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR"), None);
+}
+
+#[test]
+fn apply_output_mode_sets_only_cumulative_cfgs_reached_by_arch() {
+    let mut cmd = Command::new("cargo");
+
+    apply_output_mode(
+        &mut cmd,
+        false,
+        Some("sm_89"),
+        &MaterializationMode::default(),
+    );
+
+    let flags = command_env(&cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
+    let flags = decoded_rustflags(&flags);
+    assert!(flags.contains(&"cuda_arch=\"sm_89\""));
+    assert!(flags.contains(&"cuda_arch_ge_80"));
+    assert!(!flags.contains(&"cuda_arch_ge_90"));
+    assert!(!flags.contains(&"cuda_arch_ge_100"));
 }
 
 #[test]

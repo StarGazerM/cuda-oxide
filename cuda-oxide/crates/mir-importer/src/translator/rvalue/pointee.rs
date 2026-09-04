@@ -286,7 +286,7 @@ pub(super) fn rust_ty_is_slice(ty: &rustc_public::ty::Ty) -> bool {
     )
 }
 
-pub(super) fn normalize_slice_value_to_data_ptr(
+pub(crate) fn normalize_slice_value_to_data_ptr(
     ctx: &mut Context,
     value: Value,
     block_ptr: Ptr<BasicBlock>,

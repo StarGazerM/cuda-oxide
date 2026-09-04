@@ -183,9 +183,9 @@ fn cuda_module_host_type(
     }
     if let Some((elem_ty, mutable)) = cuda_module_slice_elem(ty) {
         let sync_host_ty = if mutable {
-            quote! { &mut ::cuda_core::DeviceBuffer<#elem_ty> }
+            quote! { &mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> }
         } else {
-            quote! { &::cuda_core::DeviceBuffer<#elem_ty> }
+            quote! { &impl ::cuda_host::KernelSliceArg<Elem = #elem_ty> }
         };
         let (async_host_ty, marshal) = if mutable {
             (
@@ -216,7 +216,7 @@ fn cuda_module_host_type(
             ));
         }
         return Ok((
-            quote! { &mut ::cuda_core::DeviceBuffer<#elem_ty> },
+            quote! { &mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
             quote! { &#async_lifetime mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
             CudaModuleParamMarshal::WritableDeviceBuffer {
                 elem_ty: quote! { #elem_ty },

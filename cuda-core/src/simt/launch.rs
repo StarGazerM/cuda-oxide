@@ -907,7 +907,12 @@ impl<C: KernelLaunchContract> PreparedLaunch<C> {
         let limits = context.launch_limits()?;
         let function_max_threads = function.max_threads_per_block()?;
         let static_shared = function.static_shared_memory_bytes()?;
-        let function_max_dynamic = function.max_dynamic_shared_memory_bytes()?;
+        let contract_dynamic_max = dynamic_shared_memory_max(C::SPEC.dynamic_shared_memory);
+        let function_max_dynamic = if contract_dynamic_max == 0 {
+            0
+        } else {
+            function.max_dynamic_shared_memory_bytes()?
+        };
 
         validate_live_shape(C::SPEC, raw, limits, function_max_threads)?;
 
@@ -915,7 +920,6 @@ impl<C: KernelLaunchContract> PreparedLaunch<C> {
         // launch's chosen size. Concurrent preparations of two range values
         // therefore write the same function attribute and cannot lower the
         // maximum underneath an already prepared launch.
-        let contract_dynamic_max = dynamic_shared_memory_max(C::SPEC.dynamic_shared_memory);
         let total_shared =
             shared_memory_total(C::SPEC.kernel_name, static_shared, contract_dynamic_max)?;
         if validate_shared_memory_limit(

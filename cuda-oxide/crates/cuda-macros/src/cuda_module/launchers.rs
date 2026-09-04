@@ -391,6 +391,7 @@ fn generate_cuda_module_legacy_launch_method(kernel: &CudaModuleKernel) -> Token
         .map(|(index, param)| cuda_module_arg_marshalling(index, param));
     let function_binding = cuda_module_function_binding(kernel);
     let launch_call = cuda_module_launch_call(kernel);
+    let arg_capacity = cuda_module_sync_arg_capacity(kernel);
     let stream = internal_ident("__cuda_oxide_stream");
     let config = internal_ident("__cuda_oxide_config");
     let args = internal_ident("__cuda_oxide_args");
@@ -413,7 +414,7 @@ fn generate_cuda_module_legacy_launch_method(kernel: &CudaModuleKernel) -> Token
         #where_clause
         {
             #function_binding
-            let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
+            let mut #args = ::cuda_host::KernelArgs::<#arg_capacity>::new();
             #(#arg_marshalling)*
             #launch_call
         }
@@ -454,6 +455,7 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
     let unchecked_function_binding = cuda_module_function_binding(kernel);
     let launch_call = cuda_module_launch_call(kernel);
     let unchecked_launch_call = cuda_module_launch_call(kernel);
+    let arg_capacity = cuda_module_sync_arg_capacity(kernel);
     let requires_checks = generate_requires_checks(kernel, RequiresLenAccess::SyncBuffer);
     let stream = internal_ident("__cuda_oxide_stream");
     let prepared = internal_ident("__cuda_oxide_prepared");
@@ -478,7 +480,7 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
             #requires_checks
             let #function = #prepared.function();
             let #config = #prepared.__raw_config();
-            let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
+            let mut #args = ::cuda_host::KernelArgs::<#arg_capacity>::new();
             #(#prepared_arg_marshalling)*
             (#launch_call).map_err(::cuda_core::LaunchContractError::from)
         }
@@ -499,7 +501,7 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
         #where_clause
         {
             #unchecked_function_binding
-            let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
+            let mut #args = ::cuda_host::KernelArgs::<#arg_capacity>::new();
             #(#unchecked_arg_marshalling)*
             #unchecked_launch_call
         }
@@ -1091,6 +1093,19 @@ fn cuda_module_owned_resources_ty(
     }
 }
 
+fn cuda_module_sync_arg_capacity(kernel: &CudaModuleKernel) -> usize {
+    kernel
+        .params
+        .iter()
+        .map(|param| match param.marshal {
+            CudaModuleParamMarshal::Scalar => 1,
+            CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. }
+            | CudaModuleParamMarshal::WritableDeviceBuffer { .. } => 2,
+            CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => 3,
+        })
+        .sum()
+}
+
 fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenStream2 {
     let name = &param.name;
     let args = internal_ident("__cuda_oxide_args");
@@ -1106,8 +1121,8 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
             let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
             let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             quote! {
-                let (mut #ptr_name, mut #len_name) =
-                    ::cuda_host::read_only_device_buffer_arg(#name);
+                let mut #ptr_name = ::cuda_host::KernelSliceArg::cu_deviceptr(#name);
+                let mut #len_name = ::cuda_host::KernelSliceArg::len(#name) as u64;
                 ::cuda_host::push_kernel_device_slice(
                     &mut #args,
                     &mut #ptr_name,
@@ -1119,8 +1134,8 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
             let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
             let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             quote! {
-                let (mut #ptr_name, mut #len_name) =
-                    ::cuda_host::writable_device_buffer_arg(#name);
+                let mut #ptr_name = ::cuda_host::KernelSliceArg::cu_deviceptr(#name);
+                let mut #len_name = ::cuda_host::KernelSliceArg::len(#name) as u64;
                 ::cuda_host::push_kernel_device_slice(
                     &mut #args,
                     &mut #ptr_name,
@@ -1268,7 +1283,7 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
                     #config.shared_mem_bytes,
                     #cluster_dim,
                     #stream,
-                    &mut #args,
+                    #args.as_mut_slice(),
                 )
             }
         },
@@ -1281,7 +1296,7 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
                     #config.shared_mem_bytes,
                     #cluster_dim,
                     #stream,
-                    &mut #args,
+                    #args.as_mut_slice(),
                 )
             }
         },
@@ -1293,7 +1308,7 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
                     #config.block_dim,
                     #config.shared_mem_bytes,
                     #stream,
-                    &mut #args,
+                    #args.as_mut_slice(),
                 )
             }
         },
@@ -1305,7 +1320,7 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
                     #config.block_dim,
                     #config.shared_mem_bytes,
                     #stream,
-                    &mut #args,
+                    #args.as_mut_slice(),
                 )
             }
         },
