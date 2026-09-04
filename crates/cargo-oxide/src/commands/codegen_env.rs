@@ -240,6 +240,41 @@ pub(super) fn apply_codegen_configuration_or_exit(
 /// `arch` is an explicit pin (`--arch`); it becomes `CUDA_OXIDE_TARGET`, the
 /// hard override the backend honors as-is. The auto-detected GPU arch is *not*
 /// routed here -- see [`apply_device_arch_hint`].
+fn append_architecture_cfgs(cmd: &mut Command, target_arch: &str) {
+    let Ok(arch) = target_arch.parse::<cuda_artifact_finalizer::CudaArch>() else {
+        return;
+    };
+    let mut encoded = cmd
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("CARGO_ENCODED_RUSTFLAGS"))
+        .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let mut append = |flag: &str| {
+        if !encoded.is_empty() {
+            encoded.push(ENCODED_RUSTFLAGS_SEPARATOR);
+        }
+        encoded.push_str(flag);
+    };
+
+    append("--check-cfg=cfg(cuda_arch,values(any()))");
+    append("--check-cfg=cfg(cuda_arch_ge_80)");
+    append("--check-cfg=cfg(cuda_arch_ge_90)");
+    append("--check-cfg=cfg(cuda_arch_ge_100)");
+    append("--cfg");
+    append(&format!("cuda_arch=\"{}\"", arch.sm()));
+    for (minimum, cfg) in [
+        (80, "cuda_arch_ge_80"),
+        (90, "cuda_arch_ge_90"),
+        (100, "cuda_arch_ge_100"),
+    ] {
+        if arch.capability() >= minimum {
+            append("--cfg");
+            append(cfg);
+        }
+    }
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded);
+}
+
 pub(super) fn apply_output_mode(
     cmd: &mut Command,
     emit_nvvm_ir: bool,
@@ -248,6 +283,7 @@ pub(super) fn apply_output_mode(
 ) {
     if let Some(target_arch) = arch {
         cmd.env("CUDA_OXIDE_TARGET", target_arch);
+        append_architecture_cfgs(cmd, target_arch);
     }
     if emit_nvvm_ir || materialization.enabled() {
         cmd.env("CUDA_OXIDE_EMIT_NVVM_IR", "1");

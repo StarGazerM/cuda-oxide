@@ -32,7 +32,7 @@ use crate::error::{DriverError, IntoResult};
 use std::borrow::Cow;
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// An RAII wrapper around a `CUmodule` handle.
 ///
@@ -156,6 +156,12 @@ fn null_terminated_image(image: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+#[derive(Debug, Default)]
+struct FunctionAttributeCache {
+    max_threads_per_block: OnceLock<Result<u32, DriverError>>,
+    static_shared_memory_bytes: OnceLock<Result<u32, DriverError>>,
+}
+
 /// A handle to a device kernel entry point within a loaded [`CudaModule`].
 ///
 /// Holds an `Arc<CudaModule>` so the module (and transitively the context)
@@ -168,6 +174,8 @@ pub struct CudaFunction {
     /// Owning module. Prevents unloading while this function handle exists.
     #[allow(unused)]
     pub(crate) module: Arc<CudaModule>,
+    /// Immutable launch attributes shared by every clone of this function.
+    attributes: Arc<FunctionAttributeCache>,
 }
 
 /// # Safety
@@ -254,6 +262,7 @@ impl CudaModule {
         Ok(CudaFunction {
             cu_function,
             module: self.clone(),
+            attributes: Arc::new(FunctionAttributeCache::default()),
         })
     }
 }
@@ -464,14 +473,20 @@ impl CudaFunction {
 
     /// Queries the largest thread block accepted by this function.
     pub fn max_threads_per_block(&self) -> Result<u32, DriverError> {
-        self.attribute(
-            cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-        )
+        *self.attributes.max_threads_per_block.get_or_init(|| {
+            self.attribute(
+                cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            )
+        })
     }
 
     /// Queries this function's statically allocated shared memory per block.
     pub fn static_shared_memory_bytes(&self) -> Result<u32, DriverError> {
-        self.attribute(cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)
+        *self.attributes.static_shared_memory_bytes.get_or_init(|| {
+            self.attribute(
+                cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+            )
+        })
     }
 
     /// Queries the currently configured dynamic shared-memory maximum.

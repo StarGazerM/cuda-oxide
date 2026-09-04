@@ -2898,6 +2898,32 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
+        "cuda_device::read_only::load" => Ok(Some(intrinsics::memory::emit_read_only_load(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::read_only::__load_at" => {
+            Ok(Some(intrinsics::memory::emit_read_only_load_at(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
         "core::intrinsics::volatile_store" | "std::intrinsics::volatile_store" => {
             Ok(Some(intrinsics::memory::emit_volatile_store(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,

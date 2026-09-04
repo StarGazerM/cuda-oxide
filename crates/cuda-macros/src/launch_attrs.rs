@@ -17,7 +17,7 @@ use crate::cuda_module::model::{
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Expr, FnArg, GenericParam, Ident, ItemFn, Pat, Path, Stmt, Token,
+    Expr, FnArg, GenericParam, Ident, ItemFn, Pat, Path, Stmt, Token, Type,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
@@ -321,13 +321,45 @@ fn const_expr_depends_on_generics(expr: &Expr, generics: &syn::Generics) -> bool
     visitor.found
 }
 
+/// A standalone `u32` const parameter is already a valid min-const-generic
+/// argument. Turning it into an array length with `as usize` would create a
+/// new generic const expression and force every caller to enable
+/// `generic_const_exprs` for no semantic reason.
+fn is_standalone_u32_const_parameter(expr: &Expr, generics: &syn::Generics) -> bool {
+    let Expr::Path(path) = expr else {
+        return false;
+    };
+    if path.qself.is_some() || path.path.leading_colon.is_some() || path.path.segments.len() != 1 {
+        return false;
+    }
+    let name = &path.path.segments[0].ident;
+    generics.params.iter().any(|parameter| {
+        let GenericParam::Const(parameter) = parameter else {
+            return false;
+        };
+        if parameter.ident != *name {
+            return false;
+        }
+        let Type::Path(ty) = &parameter.ty else {
+            return false;
+        };
+        ty.qself.is_none()
+            && ty.path.leading_colon.is_none()
+            && ty.path.segments.len() == 1
+            && ty.path.segments[0].ident == "u32"
+    })
+}
+
 /// Make a generic constant expression evaluatable at each monomorphization.
 ///
 /// rustc requires this bound for expressions such as `P::MAX_THREADS`. The
 /// marker itself supplies the expected `u32` type; the array length is only an
 /// evaluatability witness and never reaches device code.
 pub(crate) fn add_const_evaluatable_bound(generics: &mut syn::Generics, value: &ConstU32Expr) {
-    if value.literal_value.is_some() || !const_expr_depends_on_generics(&value.expr, generics) {
+    if value.literal_value.is_some()
+        || is_standalone_u32_const_parameter(&value.expr, generics)
+        || !const_expr_depends_on_generics(&value.expr, generics)
+    {
         return;
     }
     let expr = &value.expr;

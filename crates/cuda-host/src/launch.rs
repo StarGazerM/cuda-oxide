@@ -122,6 +122,66 @@ pub trait KernelScalar: Copy {}
 
 impl<T: Copy> KernelScalar for T {}
 
+/// Fixed-capacity kernel argument packet used by generated synchronous launches.
+///
+/// The proc macro computes `N` from the flattened CUDA ABI, so argument
+/// marshalling stays on the stack and generated code does not expose raw
+/// pointers or perform heap growth between dependent kernel submissions.
+#[doc(hidden)]
+pub struct KernelArgs<const N: usize> {
+    entries: [*mut c_void; N],
+    len: usize,
+}
+
+#[doc(hidden)]
+pub trait KernelArgumentList {
+    fn push_argument(&mut self, entry: *mut c_void);
+}
+
+impl<const N: usize> KernelArgs<N> {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            entries: [std::ptr::null_mut(); N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, entry: *mut c_void) {
+        let Some(slot) = self.entries.get_mut(self.len) else {
+            panic!("generated CUDA kernel argument packet exceeded its ABI capacity");
+        };
+        *slot = entry;
+        self.len += 1;
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [*mut c_void] {
+        &mut self.entries[..self.len]
+    }
+}
+
+impl<const N: usize> Default for KernelArgs<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> KernelArgumentList for KernelArgs<N> {
+    #[inline]
+    fn push_argument(&mut self, entry: *mut c_void) {
+        self.push(entry);
+    }
+}
+
+impl KernelArgumentList for Vec<*mut c_void> {
+    #[inline]
+    fn push_argument(&mut self, entry: *mut c_void) {
+        self.push(entry);
+    }
+}
+
 /// Pushes a by-value scalar kernel argument into a CUDA driver argument list.
 ///
 /// The pointed-to value must remain alive until the launch submission call has
@@ -139,11 +199,11 @@ impl<T: Copy> KernelScalar for T {}
 /// disappears in release builds for non-ZSTs.
 #[inline]
 #[doc(hidden)]
-pub fn push_kernel_scalar<T: KernelScalar>(args: &mut Vec<*mut c_void>, value: &mut T) {
+pub fn push_kernel_scalar<T: KernelScalar>(args: &mut impl KernelArgumentList, value: &mut T) {
     if std::mem::size_of::<T>() == 0 {
         return;
     }
-    args.push(value as *mut T as *mut c_void);
+    args.push_argument(value as *mut T as *mut c_void);
 }
 
 /// Returns the `(device pointer, element count)` pair used for read-only slice
@@ -175,12 +235,12 @@ pub fn writable_device_buffer_arg<T>(
 #[inline]
 #[doc(hidden)]
 pub fn push_kernel_device_slice(
-    args: &mut Vec<*mut c_void>,
+    args: &mut impl KernelArgumentList,
     ptr: &mut cuda_core::sys::CUdeviceptr,
     len: &mut u64,
 ) {
-    args.push(ptr as *mut cuda_core::sys::CUdeviceptr as *mut c_void);
-    args.push(len as *mut u64 as *mut c_void);
+    args.push_argument(ptr as *mut cuda_core::sys::CUdeviceptr as *mut c_void);
+    args.push_argument(len as *mut u64 as *mut c_void);
 }
 
 /// A device buffer together with the row width the kernel will index it by.
@@ -301,14 +361,14 @@ pub fn row_width_device_buffer_arg<T>(
 #[inline]
 #[doc(hidden)]
 pub fn push_kernel_row_width_device_slice(
-    args: &mut Vec<*mut c_void>,
+    args: &mut impl KernelArgumentList,
     ptr: &mut cuda_core::sys::CUdeviceptr,
     len: &mut u64,
     width: &mut u32,
 ) {
-    args.push(ptr as *mut cuda_core::sys::CUdeviceptr as *mut c_void);
-    args.push(len as *mut u64 as *mut c_void);
-    args.push(width as *mut u32 as *mut c_void);
+    args.push_argument(ptr as *mut cuda_core::sys::CUdeviceptr as *mut c_void);
+    args.push_argument(len as *mut u64 as *mut c_void);
+    args.push_argument(width as *mut u32 as *mut c_void);
 }
 
 // =============================================================================
@@ -343,7 +403,6 @@ pub fn push_kernel_row_width_device_slice(
 ///     fn len(&self) -> usize { 1_000_000 }
 /// }
 /// ```
-#[cfg(feature = "async")]
 pub unsafe trait KernelSliceArg {
     /// Element type stored in the allocation.
     type Elem;
@@ -370,10 +429,8 @@ pub unsafe trait KernelSliceArg {
 /// this rule: the implementor must own exclusive device-write authority for
 /// the entire reported element range for the lifetime of the mutable borrow or
 /// owned operation.
-#[cfg(feature = "async")]
 pub unsafe trait KernelSliceArgMut: KernelSliceArg {}
 
-#[cfg(feature = "async")]
 // SAFETY: DeviceBuffer owns the reported allocation and keeps its CUDA context
 // alive; its pointer and length accessors describe that allocation exactly.
 unsafe impl<T> KernelSliceArg for cuda_core::DeviceBuffer<T> {
@@ -388,7 +445,6 @@ unsafe impl<T> KernelSliceArg for cuda_core::DeviceBuffer<T> {
     }
 }
 
-#[cfg(feature = "async")]
 // SAFETY: &mut DeviceBuffer provides exclusive host authority to launch device
 // writes through this adapter for the duration of the operation.
 unsafe impl<T> KernelSliceArgMut for cuda_core::DeviceBuffer<T> {}
@@ -904,5 +960,27 @@ mod tests {
             ptr
         );
         assert_eq!(unsafe { *(args[1] as *const u64) }, len);
+    }
+
+    #[test]
+    fn fixed_kernel_args_keep_the_generated_abi_packet_on_the_stack() {
+        let mut args = KernelArgs::<2>::new();
+        let mut ptr: cuda_core::sys::CUdeviceptr = 0xfeed_beefu64;
+        let mut len = 1024u64;
+
+        push_kernel_device_slice(&mut args, &mut ptr, &mut len);
+
+        assert_eq!(args.as_mut_slice().len(), 2);
+        assert_eq!(args.as_mut_slice()[0], &mut ptr as *mut _ as *mut c_void);
+        assert_eq!(args.as_mut_slice()[1], &mut len as *mut _ as *mut c_void);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeded its ABI capacity")]
+    fn fixed_kernel_args_fail_loudly_if_codegen_miscalculates_capacity() {
+        let mut args = KernelArgs::<1>::new();
+        let mut ptr: cuda_core::sys::CUdeviceptr = 0;
+        let mut len = 0u64;
+        push_kernel_device_slice(&mut args, &mut ptr, &mut len);
     }
 }

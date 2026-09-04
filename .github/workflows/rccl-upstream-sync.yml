@@ -1,0 +1,53 @@
+name: RCCL upstream patch review
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: rccl-upstream-patch-review
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch NVIDIA upstream
+        run: |
+          git remote add upstream https://github.com/NVlabs/cuda-oxide.git
+          git fetch --no-tags upstream main
+      - name: Compare RCCL patches with upstream
+        id: compare
+        continue-on-error: true
+        env:
+          RCCL_UPSTREAM_REPORT: /tmp/rccl-upstream-report.md
+        run: scripts/check-rccl-upstream.sh upstream/main HEAD
+      - name: Publish or update review issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RESULT: ${{ steps.compare.outcome }}
+        run: |
+          title="Automated RCCL upstream patch review"
+          body_file=/tmp/rccl-upstream-report.md
+          {
+            printf '\n## Workflow result\n\nComparison step: **%s**\n' "$RESULT"
+            printf '\nRun: %s/actions/runs/%s\n' "$GITHUB_SERVER_URL/$REPOSITORY" "$GITHUB_RUN_ID"
+          } >>"$body_file"
+          issue_number="$(gh issue list --repo "$REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$issue_number" ]]; then
+            gh issue edit "$issue_number" --repo "$REPOSITORY" --body-file "$body_file"
+          else
+            gh issue create --repo "$REPOSITORY" --title "$title" --body-file "$body_file"
+          fi
+      - name: Fail on integration conflict
+        if: steps.compare.outcome == 'failure'
+        run: exit 1

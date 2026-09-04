@@ -386,6 +386,18 @@ fn launch_bounds_keeps_policy_expressions_typed() {
 }
 
 #[test]
+fn standalone_u32_launch_bound_needs_no_generic_const_expression() {
+    let mut function: ItemFn = parse_quote! {
+        fn configured<const THREADS: u32>() {}
+    };
+    let args: LaunchBoundsArgs = syn::parse_str("THREADS").unwrap();
+    add_const_evaluatable_bound(&mut function.sig.generics, &args.max_threads);
+
+    let output = quote!(#function).to_string().replace(' ', "");
+    assert!(!output.contains("[();"), "unnecessary bound: {output}");
+}
+
+#[test]
 fn policy_unroll_expression_gets_marker_and_evaluatability_bound() {
     let func: ItemFn = parse_quote! {
         fn k<P: Policy>() {

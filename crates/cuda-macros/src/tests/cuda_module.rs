@@ -5,8 +5,8 @@
 
 use crate::cuda_module::contract::LaunchContractArgs;
 use crate::cuda_module::{
-    device_codegen_owner_selection, expand_cuda_module, expand_cuda_module_inner,
-    transform_cuda_module_items,
+    cuda_module_artifact_anchor, device_codegen_owner_selection, expand_cuda_module,
+    expand_cuda_module_inner, transform_cuda_module_items,
 };
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -84,6 +84,18 @@ fn host_cuda_module_still_emits_the_loader() {
     );
 }
 
+#[test]
+fn concrete_kernel_uses_target_specific_artifact_anchor_by_default() {
+    assert_eq!(
+        cuda_module_artifact_anchor("gpu-package", "1.2.3", "gpu_lib", None),
+        "cuda_oxide_artifact_anchor_246e25db_v2_gpu_package_1_2_3_gpu_lib_nonbin"
+    );
+    assert_eq!(
+        cuda_module_artifact_anchor("gpu-package", "1.2.3", "probe", Some("probe-example"),),
+        "cuda_oxide_artifact_anchor_246e25db_v2_gpu_package_1_2_3_probe_bin_probe_example"
+    );
+}
+
 /// A nested inline module gets its own `LoadedModule`, so it needs the
 /// same gate as the outer one.
 #[test]
@@ -158,6 +170,11 @@ fn plain_kernel_keeps_plain_driver_call() {
     assert!(
         !expanded.contains("launch_kernel_cooperative_on_stream"),
         "cooperative call must not appear without #[cooperative_launch]:\n{expanded}"
+    );
+    assert!(expanded.contains("KernelArgs::<2usize>::new()"));
+    assert!(
+        !expanded.contains("std::vec::Vec"),
+        "generated synchronous launches must not heap-grow raw ABI pointers:\n{expanded}"
     );
 }
 

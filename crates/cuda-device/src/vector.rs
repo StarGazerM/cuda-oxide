@@ -184,6 +184,10 @@ define_vector!(
     U32x4, u32, 4, 16
 );
 define_vector!(
+    /// Four `i32` in one 128-bit transaction. The `int4` equivalent.
+    I32x4, i32, 4, 16
+);
+define_vector!(
     /// Four `u16` in one 64-bit transaction.
     U16x4, u16, 4, 8
 );
@@ -221,6 +225,40 @@ pub fn as_vectors<V: Vector>(slice: &[V::Elem]) -> Option<&[V]> {
     // checked above. `V` is `repr(C)` over `LANES` values of `Elem`, so `len`
     // vectors cover exactly `slice.len()` elements.
     Some(unsafe { core::slice::from_raw_parts(slice.as_ptr().cast::<V>(), len) })
+}
+
+/// View the largest aligned prefix of a flat slice as vectors and preserve the
+/// remaining scalar tail.
+///
+/// Unlike [`as_vectors`], this accepts a length that is not a multiple of the
+/// vector width. The base must still satisfy `V`'s alignment. This is the safe
+/// representation of CUDA algorithms that vector-load complete tiles and
+/// handle the final partial tile element by element.
+#[must_use]
+pub fn as_vector_prefix<V: Vector>(slice: &[V::Elem]) -> Option<(&[V], &[V::Elem])> {
+    if slice.is_empty() {
+        return Some((&[], &[]));
+    }
+    if V::LANES == 0 || size_of::<V::Elem>() == 0 {
+        return None;
+    }
+    const {
+        assert!(
+            size_of::<V>() == V::LANES * size_of::<V::Elem>(),
+            "Vector impl violates its contract: size_of::<V>() must equal LANES * size_of::<V::Elem>()"
+        );
+    }
+    if !(slice.as_ptr() as usize).is_multiple_of(align_of::<V>()) {
+        return None;
+    }
+    let vector_len = slice.len() / V::LANES;
+    let scalar_len = vector_len * V::LANES;
+    let (prefix, tail) = slice.split_at(scalar_len);
+    // SAFETY: the base alignment and exact vector byte extent are established
+    // above. `prefix` contains an integral number of vectors and shares the
+    // input borrow; `tail` begins immediately after the non-overlapping prefix.
+    let vectors = unsafe { core::slice::from_raw_parts(prefix.as_ptr().cast::<V>(), vector_len) };
+    Some((vectors, tail))
 }
 
 /// Mutable [`as_vectors`]. Shares its semantics, including the empty-slice
@@ -318,8 +356,19 @@ mod tests {
         check!(F64x2);
         check!(U32x2);
         check!(U32x4);
+        check!(I32x4);
         check!(U16x4);
         check!(U16x8);
+    }
+
+    #[test]
+    fn vector_prefix_preserves_the_scalar_tail() {
+        let backing = [I32x4::new([1, 2, 3, 4]), I32x4::new([5, 6, 7, 8])];
+        let flat = unsafe { core::slice::from_raw_parts(backing.as_ptr().cast::<i32>(), 7) };
+        let (vectors, tail) = as_vector_prefix::<I32x4>(flat).expect("aligned prefix");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].to_array(), [1, 2, 3, 4]);
+        assert_eq!(tail, &[5, 6, 7]);
     }
 
     #[test]

@@ -211,6 +211,185 @@ pub fn emit_volatile_load(
     )
 }
 
+/// Emits the safe `cuda_device::read_only::load(&T) -> T` intrinsic.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_read_only_load(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::MirLoadOp;
+    if args.len() != 1 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "read_only::load expects 1 shared reference, got {} arguments",
+                args.len()
+            ))
+        );
+    }
+
+    let (address, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let value_ty = address
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<MirPtrType>()
+        .ok_or_else(|| {
+            pliron::input_error!(loc.clone(), "read_only::load argument is not a reference")
+        })?
+        .pointee;
+
+    let load_op = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![value_ty],
+        vec![address],
+        vec![],
+        0,
+    );
+    load_op.deref_mut(ctx).set_loc(loc.clone());
+    MirLoadOp::new(load_op).set_read_only(ctx, true);
+    match last_op {
+        Some(previous) => load_op.insert_after(ctx, previous),
+        None => load_op.insert_at_front(block_ptr, ctx),
+    }
+
+    let result = load_op.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        load_op,
+        value_map,
+        block_map,
+        loc,
+        "read_only::load call without target block",
+    )
+}
+
+/// Emits cuda-device's private, proof-carrying indexed read used by
+/// `read_only::upper_bound`.
+///
+/// The Rust implementation is the semantic authority for the interval
+/// invariant. This compiler boundary only removes the redundant per-iteration
+/// slice assertion and preserves the same read-only cache qualifier as
+/// [`emit_read_only_load`]. It is not part of cuda-device's public API.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_read_only_load_at(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirLoadOp, MirPtrOffsetOp};
+    use dialect_mir::types::MirSliceType;
+
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "read_only::__load_at expects a shared slice and index, got {} arguments",
+                args.len()
+            ))
+        );
+    }
+
+    let (slice, after_slice) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let element_ty = slice
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<MirSliceType>()
+        .ok_or_else(|| {
+            pliron::input_error!(loc.clone(), "read_only::__load_at argument is not a slice")
+        })?
+        .element_type();
+    let (data, after_data) =
+        rvalue::normalize_slice_value_to_data_ptr(ctx, slice, block_ptr, after_slice, loc.clone());
+    let (index, after_index) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        after_data,
+        loc.clone(),
+    )?;
+
+    let data_ty = data.get_type(ctx);
+    let offset = Operation::new(
+        ctx,
+        MirPtrOffsetOp::get_concrete_op_info(),
+        vec![data_ty],
+        vec![data, index],
+        vec![],
+        0,
+    );
+    offset.deref_mut(ctx).set_loc(loc.clone());
+    MirPtrOffsetOp::new(offset).set_inbounds(ctx, true);
+    match after_index {
+        Some(previous) => offset.insert_after(ctx, previous),
+        None => offset.insert_at_front(block_ptr, ctx),
+    }
+
+    let address = offset.deref(ctx).get_result(0);
+    let load = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![element_ty],
+        vec![address],
+        vec![],
+        0,
+    );
+    load.deref_mut(ctx).set_loc(loc.clone());
+    MirLoadOp::new(load).set_read_only(ctx, true);
+    load.insert_after(ctx, offset);
+
+    let result = load.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        load,
+        value_map,
+        block_map,
+        loc,
+        "read_only::__load_at call without target block",
+    )
+}
+
 /// Emits `core::intrinsics::volatile_store::<T>(ptr, value)`, which backs
 /// `core::ptr::write_volatile`.
 #[allow(clippy::too_many_arguments)]

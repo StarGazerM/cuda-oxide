@@ -37,8 +37,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use reserved_oxide_symbols::{
-    DEVICE_CODEGEN_CRATE_ENV, artifact_anchor_symbol, artifact_anchor_symbol_v2,
-    ptx_merge_required_marker,
+    DEVICE_CODEGEN_CRATE_ENV, artifact_anchor_symbol_v2, ptx_merge_required_marker,
 };
 use syn::{
     Ident, Item, ItemFn, ItemMod, LitStr, Token, parse_macro_input, parse_quote,
@@ -794,13 +793,12 @@ fn cuda_module_path_description(module_path: &[Ident]) -> String {
 /// Without this handshake the bundle was silently dropped and `load()`
 /// failed at runtime with `ModuleNotFound` (issue #72).
 ///
-/// Without an owner filter, both sides keep using the legacy package+version
-/// anchor for compatibility with older wrappers and backends. A non-empty
-/// owner filter activates the v2 package+version+crate+binary identity. That
-/// target-specific identity prevents an unselected binary from satisfying a
-/// selected library's reference (or vice versa); an unselected new macro emits
-/// no reference at all. The backend also keeps a weak legacy alias for older
-/// macro expansions in mixed-version builds.
+/// The package+version+crate+binary v2 identity prevents an example, binary,
+/// or test target from satisfying a library's anchor reference merely because
+/// both targets belong to the same Cargo package. The backend also keeps a
+/// weak legacy package-level alias for older macro expansions in mixed-version
+/// builds. An explicit owner filter can suppress an unselected crate's
+/// reference entirely, but it is not required to obtain collision-free names.
 ///
 /// The reference is only emitted when the module is guaranteed to produce
 /// an artifact for this crate. Generic kernels are monomorphized (and
@@ -841,16 +839,12 @@ fn cuda_module_artifact_anchor_statements(
     }
 
     let binary_name = std::env::var("CARGO_BIN_NAME").ok();
-    let anchor = if owner_selection.is_some() {
-        artifact_anchor_symbol_v2(
-            &package_name,
-            &package_version,
-            &crate_name,
-            binary_name.as_deref(),
-        )
-    } else {
-        artifact_anchor_symbol(&package_name, &package_version)
-    };
+    let anchor = cuda_module_artifact_anchor(
+        &package_name,
+        &package_version,
+        &crate_name,
+        binary_name.as_deref(),
+    );
     let anchor_name = LitStr::new(&anchor, proc_macro2::Span::call_site());
     let references = kernels
         .iter()
@@ -875,6 +869,15 @@ fn cuda_module_artifact_anchor_statements(
         // crate's `cuda_module_artifact_anchor_statements` for details.
         #(#references)*
     })
+}
+
+pub(crate) fn cuda_module_artifact_anchor(
+    package_name: &str,
+    package_version: &str,
+    crate_name: &str,
+    binary_name: Option<&str>,
+) -> String {
+    artifact_anchor_symbol_v2(package_name, package_version, crate_name, binary_name)
 }
 
 pub(crate) fn device_codegen_owner_selection(raw: Option<&str>, crate_name: &str) -> Option<bool> {

@@ -222,6 +222,38 @@ macro_rules! define_integer_atomic {
                 unreachable!(concat!(stringify!($Name), "::load called outside CUDA kernel context"))
             }
 
+            /// Relaxed scoped load with the ordering fixed in the callee.
+            ///
+            /// This entrypoint is useful for separately compiled generic
+            /// device code: the CUDA importer can prove the ordering without
+            /// depending on cross-crate inlining or constant propagation.
+            #[inline(always)]
+            pub fn load_relaxed(&self) -> $ty {
+                self.load(AtomicOrdering::Relaxed)
+            }
+
+            /// Cacheable snapshot for optimistic read-before-CAS algorithms.
+            ///
+            /// Unlike [`Self::load`], this is not a coherent atomic load and
+            /// may observe a stale value. It is correct only when the caller
+            /// treats the value as a CAS expectation (or otherwise validates
+            /// it atomically) and never relies on it for publication ordering.
+            /// This is the CUDA open-addressing pattern used by
+            /// cuCollections: candidate probes stay in L1 and the claim CAS is
+            /// the sole authority.
+            #[inline(always)]
+            pub fn cached_snapshot(&self) -> $ty {
+                // This device special-register read traps before the pointer
+                // access in host execution and lowers to a register move in a
+                // CUDA kernel. Target cfg cannot express this boundary because
+                // cuda-oxide imports MIR from the host-built dependency.
+                let _device_lane = crate::warp::lane_id();
+                // SAFETY: integer atomics are repr(transparent) over their
+                // integer word. The result is explicitly an optimistic,
+                // non-publishing snapshot and must be validated by the caller.
+                unsafe { (self as *const Self).cast::<$ty>().read() }
+            }
+
             /// Atomically store a value.
             ///
             /// `order` must be `Relaxed`, `Release`, or `SeqCst`.
@@ -331,6 +363,27 @@ macro_rules! define_integer_atomic {
                 failure: AtomicOrdering,
             ) -> Result<$ty, $ty> {
                 let old = self.compare_exchange_raw(current, new, success, failure);
+                if old == current {
+                    Ok(old)
+                } else {
+                    Err(old)
+                }
+            }
+
+            /// Relaxed compare-and-exchange with both orderings fixed at the
+            /// intrinsic call site.
+            #[inline(always)]
+            pub fn compare_exchange_relaxed(
+                &self,
+                current: $ty,
+                new: $ty,
+            ) -> Result<$ty, $ty> {
+                let old = self.compare_exchange_raw(
+                    current,
+                    new,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                );
                 if old == current {
                     Ok(old)
                 } else {
@@ -470,6 +523,25 @@ define_integer_atomic! {
 define_integer_atomic! {
     /// 64-bit unsigned atomic, **device scope** (`.gpu`).
     pub struct DeviceAtomicU64(u64);
+}
+
+impl DeviceAtomicU64 {
+    /// Cacheable snapshot of the low 32-bit lane of this packed atomic word.
+    ///
+    /// This has the same optimistic, non-publishing contract as
+    /// [`Self::cached_snapshot`]. It exists for packed open-addressing tables
+    /// whose no-tombstone probe needs only the key half and validates a claim
+    /// by CAS against a known complete empty word. CUDA targets are
+    /// little-endian, so the low integer lane occupies the first four bytes.
+    #[inline(always)]
+    pub fn cached_low_u32(&self) -> u32 {
+        let _device_lane = crate::warp::lane_id();
+        // SAFETY: `DeviceAtomicU64` is repr(transparent) over an aligned u64.
+        // The first four bytes are therefore a valid, aligned u32 snapshot on
+        // the supported little-endian CUDA target. Callers may use it only as
+        // an optimistic probe followed by atomic validation.
+        unsafe { (self as *const Self).cast::<u32>().read() }
+    }
 }
 
 define_integer_atomic! {

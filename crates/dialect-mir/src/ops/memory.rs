@@ -611,7 +611,8 @@ impl Verify for MirMemmoveOp {
     format,
     interfaces = [NOpdsInterface<1>, OneOpdInterface, NResultsInterface<1>, OneResultInterface],
     attributes = (
-        mir_load_volatile: IntegerAttr
+        mir_load_volatile: IntegerAttr,
+        mir_load_read_only: IntegerAttr
     )
 )]
 pub struct MirLoadOp;
@@ -637,6 +638,18 @@ impl MirLoadOp {
     pub fn set_volatile(&self, ctx: &mut Context, volatile: bool) {
         let attr = bool_integer_attr(ctx, volatile);
         self.set_attr_mir_load_volatile(ctx, attr);
+    }
+
+    /// Whether this load must use the read-only global-memory cache path.
+    pub fn is_read_only(&self, ctx: &Context) -> bool {
+        self.get_attr_mir_load_read_only(ctx)
+            .is_some_and(|attr| attr.value().to_u64() != 0)
+    }
+
+    /// Preserve this load as one read-only global-memory transaction.
+    pub fn set_read_only(&self, ctx: &mut Context, read_only: bool) {
+        let attr = bool_integer_attr(ctx, read_only);
+        self.set_attr_mir_load_read_only(ctx, attr);
     }
 }
 

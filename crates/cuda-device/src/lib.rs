@@ -44,6 +44,7 @@ pub mod int;
 pub mod mma_frag;
 pub mod prmt;
 pub mod ptx;
+pub mod read_only;
 pub mod shared;
 pub mod swizzle;
 pub mod tcgen05;

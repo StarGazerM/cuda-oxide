@@ -54,4 +54,5 @@ pub use place_read::translate_place;
 pub(crate) use const_bytes::constant_bytes;
 pub(crate) use place_addr::{enum_payload_needs_storage_coercion_pub, translate_place_address};
 pub(crate) use place_read::apply_enum_field_projection_pub;
+pub(crate) use pointee::normalize_slice_value_to_data_ptr;
 pub(crate) use promoted::translate_array_constant_into_alloca;

@@ -12,7 +12,11 @@ use super::common::{
 use super::debug::copy_debug_local_variable;
 use crate::convert::types::{convert_type, mir_type_abi_align};
 use dialect_mir::types::MirPtrType;
+use llvm_export::op_interfaces::{BinArithOp, CastOpInterface};
 use llvm_export::ops as llvm;
+use llvm_export::ops::{AsmKind, InlineAsmOpExt};
+use llvm_export::types::{ArrayType, StructLayout, StructType};
+use pliron::builtin::type_interfaces::FloatTypeInterface;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -22,7 +26,7 @@ use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
-use pliron::r#type::Typed;
+use pliron::r#type::{Typed, type_cast};
 
 /// Convert `mir.store` to `llvm.store`.
 ///
@@ -100,6 +104,19 @@ pub(crate) fn convert_load(
 
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
+    if dialect_mir::ops::MirLoadOp::new(op).is_read_only(ctx) {
+        if let Some(kind) = read_only_scalar_kind(ctx, llvm_ty) {
+            return convert_read_only_scalar(ctx, rewriter, op, ptr, llvm_ty, kind);
+        }
+        let Some(paths) = read_only_i32x4_paths(ctx, llvm_ty) else {
+            return pliron::input_err_noloc!(
+                "cuda_device::read_only::load requires a primitive 8-, 16-, 32-, or 64-bit \
+                 scalar or the I32x4 aggregate shape"
+            );
+        };
+        return convert_read_only_i32x4(ctx, rewriter, op, ptr, llvm_ty, &paths);
+    }
+
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
     if dialect_mir::ops::MirLoadOp::new(op).is_volatile(ctx) {
         llvm_export::ops::set_op_volatile(ctx, llvm_load.get_operation(), true);
@@ -125,6 +142,193 @@ pub(crate) fn convert_load(
     rewriter.insert_operation(ctx, llvm_load.get_operation());
     rewriter.replace_operation(ctx, op, llvm_load.get_operation());
 
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ReadOnlyScalarKind {
+    Integer(u32),
+    Float(u32),
+}
+
+/// Classify the primitive scalar forms supported by CUDA's read-only cache
+/// instruction. Smaller integers are loaded into a 32-bit PTX register and
+/// truncated back to their Rust value type; this preserves their bit pattern
+/// without giving the compiler permission to read adjacent bytes.
+fn read_only_scalar_kind(
+    ctx: &Context,
+    ty: pliron::r#type::TypeHandle,
+) -> Option<ReadOnlyScalarKind> {
+    let ty_ref = ty.deref(ctx);
+    if let Some(integer) = ty_ref.downcast_ref::<IntegerType>() {
+        return matches!(integer.width(), 8 | 16 | 32 | 64)
+            .then_some(ReadOnlyScalarKind::Integer(integer.width()));
+    }
+    let float = type_cast::<dyn FloatTypeInterface>(&*ty_ref)?;
+    let width = u32::try_from(float.get_semantics().bits).ok()?;
+    matches!(width, 32 | 64).then_some(ReadOnlyScalarKind::Float(width))
+}
+
+/// Lower a safe shared borrow to one cache-qualified scalar transaction.
+///
+/// This is compiler-owned PTX selection: Rust device code only expresses a
+/// shared `&T` read through `cuda_device::read_only::load` and never handles a
+/// raw address or inline assembly itself.
+fn convert_read_only_scalar(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    ptr: pliron::value::Value,
+    result_ty: pliron::r#type::TypeHandle,
+    kind: ReadOnlyScalarKind,
+) -> Result<()> {
+    let (load_ty, instruction, constraints, truncate) = match kind {
+        ReadOnlyScalarKind::Integer(8) => (
+            IntegerType::get(ctx, 32, Signedness::Signless).into(),
+            "ld.global.nc.u8 $0, [$1];",
+            "=r,l",
+            true,
+        ),
+        ReadOnlyScalarKind::Integer(16) => (
+            IntegerType::get(ctx, 32, Signedness::Signless).into(),
+            "ld.global.nc.u16 $0, [$1];",
+            "=r,l",
+            true,
+        ),
+        ReadOnlyScalarKind::Integer(32) => (result_ty, "ld.global.nc.b32 $0, [$1];", "=r,l", false),
+        ReadOnlyScalarKind::Integer(64) => (result_ty, "ld.global.nc.b64 $0, [$1];", "=l,l", false),
+        ReadOnlyScalarKind::Float(32) => (result_ty, "ld.global.nc.f32 $0, [$1];", "=f,l", false),
+        ReadOnlyScalarKind::Float(64) => (result_ty, "ld.global.nc.f64 $0, [$1];", "=d,l", false),
+        ReadOnlyScalarKind::Integer(_) | ReadOnlyScalarKind::Float(_) => unreachable!(),
+    };
+
+    let load = llvm::InlineAsmOp::build(
+        ctx,
+        load_ty,
+        vec![ptr],
+        instruction,
+        constraints,
+        AsmKind::SideEffect,
+    );
+    crate::convert::preserve_location(ctx, op, load.get_operation());
+    rewriter.insert_operation(ctx, load.get_operation());
+    let loaded = load.get_operation().deref(ctx).get_result(0);
+    if truncate {
+        let truncated = llvm::TruncOp::new(ctx, loaded, result_ty);
+        rewriter.insert_operation(ctx, truncated.get_operation());
+        rewriter.replace_operation(ctx, op, truncated.get_operation());
+    } else {
+        rewriter.replace_operation(ctx, op, load.get_operation());
+    }
+    Ok(())
+}
+
+/// Recognize the lowered shape of cuda-device's over-aligned `I32x4`.
+///
+/// The public Rust type contains one `[i32; 4]` field today. Accepting the
+/// equivalent flat four-field shape keeps the intrinsic coupled to the value's
+/// semantic lanes instead of to one incidental aggregate nesting choice.
+fn read_only_i32x4_paths(ctx: &Context, ty: pliron::r#type::TypeHandle) -> Option<Vec<Vec<u32>>> {
+    fn is_i32(ctx: &Context, ty: pliron::r#type::TypeHandle) -> bool {
+        ty.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|integer| integer.width() == 32)
+    }
+
+    if let Some(array) = ty.deref(ctx).downcast_ref::<ArrayType>()
+        && array.size() == 4
+        && is_i32(ctx, array.elem_type())
+    {
+        return Some((0..4).map(|lane| vec![lane]).collect());
+    }
+
+    let structure = ty.deref(ctx);
+    let structure = structure.downcast_ref::<StructType>()?;
+    if structure.layout() != StructLayout::Unpacked {
+        return None;
+    }
+    if structure.num_fields() == 4 && structure.fields().all(|field| is_i32(ctx, field)) {
+        return Some((0..4).map(|lane| vec![lane]).collect());
+    }
+    if structure.num_fields() == 1 {
+        let field = structure.field_type(0);
+        let field_ref = field.deref(ctx);
+        let array = field_ref.downcast_ref::<ArrayType>()?;
+        if array.size() == 4 && is_i32(ctx, array.elem_type()) {
+            return Some((0..4).map(|lane| vec![0, lane]).collect());
+        }
+    }
+    None
+}
+
+/// Preserve one 16-byte read-only transaction even when later code consumes
+/// individual lanes. LLVM otherwise scalarizes the aggregate before NVPTX
+/// instruction selection; this first-class compiler intrinsic is the same
+/// boundary CUDA's `ThreadLoad<LOAD_LDG>` requires for `int4`.
+fn convert_read_only_i32x4(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    ptr: pliron::value::Value,
+    result_ty: pliron::r#type::TypeHandle,
+    lane_paths: &[Vec<u32>],
+) -> Result<()> {
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+    let pair_ty = StructType::get_unnamed(
+        ctx,
+        (vec![i64_ty.into(), i64_ty.into()], StructLayout::Unpacked),
+    );
+    let load = llvm::InlineAsmOp::build(
+        ctx,
+        pair_ty.into(),
+        vec![ptr],
+        "ld.global.nc.v2.u64 {$0, $1}, [$2];",
+        "=l,=l,l",
+        AsmKind::SideEffect,
+    );
+    crate::convert::preserve_location(ctx, op, load.get_operation());
+    rewriter.insert_operation(ctx, load.get_operation());
+    let pair = load.get_operation().deref(ctx).get_result(0);
+
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let shift_attr = pliron::builtin::attributes::IntegerAttr::new(
+        i64_ty,
+        pliron::utils::apint::APInt::from_u64(
+            32,
+            std::num::NonZeroUsize::new(64).expect("64 is nonzero"),
+        ),
+    );
+    let shift = llvm::ConstantOp::new(ctx, shift_attr.into());
+    rewriter.insert_operation(ctx, shift.get_operation());
+    let shift = shift.get_operation().deref(ctx).get_result(0);
+
+    let mut lanes = Vec::with_capacity(4);
+    for word_index in 0..2u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, pair, vec![word_index])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let word = extract.get_operation().deref(ctx).get_result(0);
+
+        let low = llvm::TruncOp::new(ctx, word, i32_ty.into());
+        rewriter.insert_operation(ctx, low.get_operation());
+        lanes.push(low.get_operation().deref(ctx).get_result(0));
+
+        let high = llvm::LShrOp::new(ctx, word, shift);
+        rewriter.insert_operation(ctx, high.get_operation());
+        let high = high.get_operation().deref(ctx).get_result(0);
+        let high = llvm::TruncOp::new(ctx, high, i32_ty.into());
+        rewriter.insert_operation(ctx, high.get_operation());
+        lanes.push(high.get_operation().deref(ctx).get_result(0));
+    }
+
+    let undef = llvm::UndefOp::new(ctx, result_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let mut value = undef.get_operation().deref(ctx).get_result(0);
+    for (lane, path) in lanes.into_iter().zip(lane_paths) {
+        let insert = llvm::InsertValueOp::new(ctx, value, lane, path.clone());
+        rewriter.insert_operation(ctx, insert.get_operation());
+        value = insert.get_operation().deref(ctx).get_result(0);
+    }
+    rewriter.replace_operation_with_values(ctx, op, vec![value]);
     Ok(())
 }
 

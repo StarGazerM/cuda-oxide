@@ -731,11 +731,10 @@ impl CodegenBackend for CudaCodegenBackend {
                                 &device_config.output_dir,
                                 &device_config.output_name,
                                 tcx.sess.target.llvm_target.as_ref(),
-                                &result,
-                                artifact,
-                                device_functions,
-                                self.config.device_codegen_crates.is_some(),
-                                materialization_request,
+                                    &result,
+                                    artifact,
+                                    device_functions,
+                                    materialization_request,
                             ) {
                                 Ok(path) => {
                                     if self.config.verbose {
@@ -844,7 +843,6 @@ fn write_device_artifact_object(
     result: &device_codegen::DeviceCodegenResult,
     artifact: &device_codegen::DeviceCodegenArtifact,
     functions: &[collector::CollectedFunction<'_>],
-    use_target_specific_anchor: bool,
     materialization_request: Option<materialize::MaterializationRequest>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
@@ -911,33 +909,28 @@ fn write_device_artifact_object(
     // this crate is a library, the artifact object becomes an rlib archive
     // member, and the linker only extracts it if some other object holds an
     // undefined reference to a symbol defined here. The `#[cuda_module]`
-    // macro emits that reference from the generated `load_named()`. Normal
-    // builds preserve the legacy package-level symbol. Owner-filtered builds
-    // use a target-specific v2 symbol plus a weak legacy alias, so an older
-    // macro still links without letting a filtered target hide a selected
-    // target's artifact. Without an anchor, library-crate bundles were
-    // dead-stripped and `load()` failed at runtime with ModuleNotFound
-    // (issue #72).
+    // macro emits that reference from the generated `load_named()`. Every
+    // artifact uses a target-specific v2 symbol so a package's example,
+    // binary, test, and library bundles cannot satisfy one another's anchor
+    // references. A weak legacy alias keeps older macro expansions linkable.
+    // Without an anchor, library-crate bundles were dead-stripped and `load()`
+    // failed at runtime with ModuleNotFound (issue #72).
     let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let legacy_anchor =
         reserved_oxide_symbols::artifact_anchor_symbol(&bundle_name, &package_version);
-    let object = if use_target_specific_anchor {
-        let binary_name = std::env::var("CARGO_BIN_NAME").ok();
-        let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
-            &bundle_name,
-            &package_version,
-            output_name,
-            binary_name.as_deref(),
-        );
-        oxide_artifacts::build_host_object_for_target_with_legacy_anchor(
-            &blob,
-            host_target,
-            &target_anchor,
-            &legacy_anchor,
-        )?
-    } else {
-        oxide_artifacts::build_host_object_for_target(&blob, host_target, Some(&legacy_anchor))?
-    };
+    let binary_name = std::env::var("CARGO_BIN_NAME").ok();
+    let target_anchor = reserved_oxide_symbols::artifact_anchor_symbol_v2(
+        &bundle_name,
+        &package_version,
+        output_name,
+        binary_name.as_deref(),
+    );
+    let object = oxide_artifacts::build_host_object_for_target_with_legacy_anchor(
+        &blob,
+        host_target,
+        &target_anchor,
+        &legacy_anchor,
+    )?;
     write_artifact_object(output_dir, output_name, host_target, &object, "embed")
 }
 
