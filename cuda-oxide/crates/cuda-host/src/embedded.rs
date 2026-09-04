@@ -172,10 +172,16 @@ pub fn merge_ptx_bundles<'a>(
                     name: bundle.name.clone(),
                 })?
                 .trim_end_matches('\0');
+            let ptx_str = strip_ptx_merge_debug(ptx_str).map_err(|reason| {
+                EmbeddedModuleError::InvalidPtx {
+                    name: bundle.name.clone(),
+                    reason,
+                }
+            })?;
 
             let strip_headers = found_any;
             let (body, max_file_index) =
-                prepare_bundle_body(ptx_str, strip_headers, file_index_offset).map_err(
+                prepare_bundle_body(&ptx_str, strip_headers, file_index_offset).map_err(
                     |reason| EmbeddedModuleError::InvalidPtx {
                         name: bundle.name.clone(),
                         reason,
@@ -277,6 +283,54 @@ fn shift_file_index(
             .map_err(|error| error.to_string())?;
     }
     Ok(shifted)
+}
+
+/// Remove debug sections whose local string labels collide across bundles.
+/// Keep `.file` and `.loc`: `prepare_bundle_body` remaps their numeric indices.
+fn strip_ptx_merge_debug(ptx: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(ptx.len());
+    let mut in_debug_section = false;
+    let mut saw_section_body = false;
+    let mut debug_section_depth = 0_i32;
+
+    for line in ptx.lines() {
+        let trimmed = line.trim_start();
+        if !in_debug_section {
+            if trimmed.starts_with(".section") && trimmed.contains(".debug_") {
+                in_debug_section = true;
+                saw_section_body = line.contains('{');
+                debug_section_depth =
+                    line.bytes().filter(|byte| *byte == b'{').count() as i32
+                        - line.bytes().filter(|byte| *byte == b'}').count() as i32;
+                if debug_section_depth < 0 {
+                    return Err("malformed PTX debug section".to_string());
+                }
+                if saw_section_body && debug_section_depth == 0 {
+                    in_debug_section = false;
+                }
+                continue;
+            }
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
+        saw_section_body |= line.contains('{');
+        debug_section_depth += line.bytes().filter(|byte| *byte == b'{').count() as i32;
+        debug_section_depth -= line.bytes().filter(|byte| *byte == b'}').count() as i32;
+        if debug_section_depth < 0 {
+            return Err("malformed PTX debug section".to_string());
+        }
+        if saw_section_body && debug_section_depth == 0 {
+            in_debug_section = false;
+            saw_section_body = false;
+        }
+    }
+
+    if in_debug_section {
+        return Err("unterminated PTX debug section".to_string());
+    }
+    Ok(output)
 }
 
 /// Load the first embedded artifact bundle with a supported payload.
@@ -552,6 +606,28 @@ mod tests {
             declared.len(),
             deduped.len(),
             "duplicate .file index: {declared:?}"
+        );
+    }
+
+    #[test]
+    fn strips_module_scoped_debug_records_before_merge() {
+        let ptx = "\
+.version 7.8
+.file 1 \"kernel.rs\"
+.visible .entry kernel() {
+    .loc 1 7 3
+    ret;
+}
+.section .debug_str
+{
+$L__info_string0:
+.b8 0
+}
+.section .debug_macinfo { }
+";
+        assert_eq!(
+            strip_ptx_merge_debug(ptx).unwrap(),
+            ".version 7.8\n.file 1 \"kernel.rs\"\n.visible .entry kernel() {\n    .loc 1 7 3\n    ret;\n}\n"
         );
     }
 
