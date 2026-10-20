@@ -12,6 +12,8 @@ pub use cuda_core::embedded::{
     embedded_modules_from_current_exe,
 };
 use cuda_core::{CudaContext, CudaModule, DriverError};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -129,6 +131,11 @@ fn artifact_bundles_containing(
 /// All kernel symbols are therefore available regardless of which crate bundle
 /// they were compiled into.
 ///
+/// A cross-crate device function reached by kernels in several crates is
+/// emitted into each of their bundles. Later copies whose code matches the
+/// first definition are dropped; a same-named definition with different code
+/// is reported as invalid PTX instead of being resolved arbitrarily.
+///
 /// Bundles with non-PTX payloads (NVVM IR, LTOIR, cubin) are skipped; use
 /// `load_embedded_module` for those.
 pub fn load_all_ptx_bundles_merged(
@@ -161,6 +168,7 @@ pub fn merge_ptx_bundles<'a>(
 ) -> Result<String, EmbeddedModuleError> {
     let mut merged = String::new();
     let mut found_any = false;
+    let mut defined = HashMap::new();
 
     // Keep each bundle's debug file indices distinct in the merged module.
     let mut file_index_offset = 0;
@@ -188,6 +196,12 @@ pub fn merge_ptx_bundles<'a>(
                     },
                 )?;
             file_index_offset = file_index_offset.max(max_file_index);
+            let body = drop_duplicate_definitions(&body, &bundle.name, &mut defined).map_err(
+                |reason| EmbeddedModuleError::InvalidPtx {
+                    name: bundle.name.clone(),
+                    reason,
+                },
+            )?;
             merged.push_str(&body);
             if !body.ends_with('\n') {
                 merged.push('\n');
@@ -283,6 +297,89 @@ fn shift_file_index(
             .map_err(|error| error.to_string())?;
     }
     Ok(shifted)
+}
+
+/// Delete callable definitions already contributed by an earlier bundle.
+///
+/// `defined` maps each callable name to its first bundle and canonical code.
+/// Copies are compared without trivia and with body-local labels renumbered,
+/// because label numbering depends on the function's position in its bundle.
+fn drop_duplicate_definitions(
+    ptx: &str,
+    bundle: &str,
+    defined: &mut HashMap<String, (String, String)>,
+) -> Result<String, String> {
+    let document = ptx_parse::Document::parse(ptx).map_err(|error| error.to_string())?;
+    let mut edits = ptx_parse::EditScript::new();
+    for callable in document.callables() {
+        let Some(body) = callable.body_span() else {
+            continue;
+        };
+        let code = canonical_definition(&document, callable.span(), body);
+        match defined.get(callable.name()) {
+            Some((_, first)) if *first == code => edits
+                .delete(callable.span())
+                .map_err(|error| error.to_string())?,
+            Some((owner, _)) => {
+                return Err(format!(
+                    "`{}` is defined differently in bundles `{owner}` and `{bundle}`",
+                    callable.name()
+                ));
+            }
+            None => {
+                defined.insert(callable.name().to_string(), (bundle.to_string(), code));
+            }
+        }
+    }
+    edits.apply(ptx).map_err(|error| error.to_string())
+}
+
+/// Non-trivia, non-debug tokens of one definition, with labels defined in its
+/// body replaced by their ordinal. Debug locations differ between bundles even
+/// when the executable code is identical.
+fn canonical_definition(
+    document: &ptx_parse::Document<'_>,
+    span: Range<usize>,
+    body: Range<usize>,
+) -> String {
+    let source = document.source();
+    let labels: HashMap<&str, usize> = document
+        .labels()
+        .iter()
+        .filter(|label| body.contains(&label.span().start))
+        .enumerate()
+        .map(|(ordinal, label)| (label.name(), ordinal))
+        .collect();
+    let tokens = document.tokens();
+    let first = tokens.partition_point(|token| token.span().start < span.start);
+    let mut debug_spans = document
+        .directives_in(span.clone())
+        .filter(|directive| matches!(directive.name(), ".file" | ".loc"))
+        .map(|directive| directive.span())
+        .peekable();
+    let mut code = String::new();
+    for token in tokens[first..].iter().take_while(|token| token.span().end <= span.end) {
+        if token.kind().is_trivia() {
+            continue;
+        }
+        let start = token.span().start;
+        while debug_spans.peek().is_some_and(|debug| debug.end <= start) {
+            debug_spans.next();
+        }
+        if debug_spans.peek().is_some_and(|debug| debug.contains(&start)) {
+            continue;
+        }
+        let text = token.text(source);
+        match labels.get(text) {
+            Some(ordinal) => {
+                code.push_str("$L");
+                code.push_str(&ordinal.to_string());
+            }
+            None => code.push_str(text),
+        }
+        code.push(' ');
+    }
+    code
 }
 
 /// Remove debug sections whose local string labels collide across bundles.
@@ -629,6 +726,53 @@ $L__info_string0:
             strip_ptx_merge_debug(ptx).unwrap(),
             ".version 7.8\n.file 1 \"kernel.rs\"\n.visible .entry kernel() {\n    .loc 1 7 3\n    ret;\n}\n"
         );
+    }
+
+    #[test]
+    fn merge_drops_relabelled_copies_and_rejects_conflicting_definitions() {
+        let first = "\
+.visible .func (.param .b32 r) pick(.param .b32 a)
+{
+    @%p1 bra $L__BB14_2;
+$L__BB14_2:                 // %bb2
+    ret;
+}
+.visible .entry one() { ret; }
+";
+        let relabelled = "\
+.visible .func (.param .b32 r) pick(.param .b32 a)
+{
+    @%p1 bra $L__BB33_2;
+$L__BB33_2:                 // %bb7
+    ret;
+}
+.visible .entry two() { ret; }
+";
+        let mut defined = HashMap::new();
+        assert_eq!(drop_duplicate_definitions(first, "a", &mut defined).unwrap(), first);
+        let kept = drop_duplicate_definitions(relabelled, "b", &mut defined).unwrap();
+        assert!(!kept.contains("pick("), "identical copy must be dropped: {kept}");
+        assert!(kept.contains(".visible .entry two()"));
+
+        let conflicting = relabelled.replace("ret;\n}", "exit;\n}");
+        let error = drop_duplicate_definitions(&conflicting, "c", &mut defined).unwrap_err();
+        assert!(error.contains("`pick`") && error.contains("`a`") && error.contains("`c`"), "{error}");
+    }
+
+    #[test]
+    fn merge_deduplicates_functions_with_remapped_debug_locations() {
+        let first = ptx_bundle(
+            "first",
+            ".file 1 \"a.rs\"\n.visible .func shared() {\n.loc 1 2 3\nret;\n}\n",
+        );
+        let second = ptx_bundle(
+            "second",
+            ".file 1 \"b.rs\"\n.visible .func shared() {\n.loc 1 4 5\nret;\n}\n",
+        );
+        let merged = merge_ptx_bundles([&first, &second]).unwrap();
+        assert_eq!(merged.matches(".func shared()").count(), 1);
+        assert!(merged.contains(".file 2 \"b.rs\""));
+        assert!(merged.contains(".loc 1 2 3"));
     }
 
     #[test]
