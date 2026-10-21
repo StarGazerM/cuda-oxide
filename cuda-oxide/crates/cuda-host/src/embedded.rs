@@ -541,6 +541,16 @@ mod tests {
     }
 
     #[test]
+    fn merge_debug_strip_keeps_local_depots() {
+        let ptx = ".file 1 \"a.rs\"\n.loc 1 2 3\n\t.local .align 8 .b8 __local_depot12[16];\n\tmov.u64 %rd1, __local_depot12;\n";
+        let stripped = strip_ptx_merge_debug(ptx).unwrap();
+        let (body, _) = prepare_bundle_body(&stripped, false, 3).unwrap();
+        assert!(body.contains(".file 4 \"a.rs\""));
+        assert!(body.contains(".loc 4 2 3"));
+        assert!(body.contains(".local .align 8 .b8 __local_depot12[16];"));
+    }
+
+    #[test]
     fn target_arch_uses_bundle_sm_target() {
         assert_eq!(
             concrete_bundle_target("sm_90")
