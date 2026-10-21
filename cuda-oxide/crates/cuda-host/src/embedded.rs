@@ -141,6 +141,27 @@ fn artifact_bundles_containing(
 pub fn load_all_ptx_bundles_merged(
     ctx: &Arc<CudaContext>,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+    // The embedded bundles are immutable for the life of the process, so the
+    // merged module for a context is built once and shared; repeated loads
+    // (one per runtime program instance) must not re-parse and re-JIT it.
+    thread_local! {
+        static MERGED: std::cell::RefCell<Vec<(usize, Arc<CudaModule>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = ctx.cu_ctx() as usize;
+    if let Some(module) = MERGED.with(|cache| {
+        cache.borrow().iter().find(|(k, _)| *k == key).map(|(_, m)| m.clone())
+    }) {
+        return Ok(module);
+    }
+    let module = load_all_ptx_bundles_merged_uncached(ctx)?;
+    MERGED.with(|cache| cache.borrow_mut().push((key, module.clone())));
+    Ok(module)
+}
+
+fn load_all_ptx_bundles_merged_uncached(
+    ctx: &Arc<CudaContext>,
+) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
     let bundles = artifact_bundles_from_current_exe()?;
     let merged = merge_ptx_bundles(&bundles)?;
 
