@@ -180,6 +180,16 @@ contract. `load`, `load_async`, `from_module`, `load_named`, and
 For generic modules, the caller must also ensure the merged PTX bundles contain
 the matching specializations and no conflicting entry definitions. Preparation
 and repeated launches are safe after that binding.
+The merger namespaces compiler-generated static shared globals (`__shared_mem_N`)
+per bundle before comparing callable definitions. Module-local allocation numbers
+therefore cannot collide across independently compiled libraries. Explicitly named
+shared symbols and external dynamic shared declarations keep their linkage names;
+callables using different static storage are rejected rather than deduplicated.
+The merger preserves `.file` and `.loc` records by remapping their file indices,
+including `inlined_at` references, and leaves `.local` declarations intact. It
+removes `.debug_*` sections because their module-local labels can collide.
+Callable comparison ignores debug locations as well as trivia and local label
+numbering, so remapped source locations do not prevent identical-code deduplication.
 
 The declared dynamic shared-memory byte range is an author contract because
 arbitrary pointer offsets cannot be inferred. Alignment is compiler-enforced:

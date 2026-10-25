@@ -194,7 +194,7 @@ pub fn merge_ptx_bundles<'a>(
     // Keep each bundle's debug file indices distinct in the merged module.
     let mut file_index_offset = 0;
 
-    for bundle in bundles {
+    for (bundle_index, bundle) in bundles.into_iter().enumerate() {
         if let Some(ptx_bytes) = bundle.payload(ArtifactPayloadKind::Ptx) {
             let ptx_str = std::str::from_utf8(ptx_bytes)
                 .map_err(|_| EmbeddedModuleError::UnsupportedPayload {
@@ -217,6 +217,12 @@ pub fn merge_ptx_bundles<'a>(
                     },
                 )?;
             file_index_offset = file_index_offset.max(max_file_index);
+            let body = namespace_static_shared(&body, bundle_index).map_err(|reason| {
+                EmbeddedModuleError::InvalidPtx {
+                    name: bundle.name.clone(),
+                    reason,
+                }
+            })?;
             let body = drop_duplicate_definitions(&body, &bundle.name, &mut defined).map_err(
                 |reason| EmbeddedModuleError::InvalidPtx {
                     name: bundle.name.clone(),
@@ -318,6 +324,51 @@ fn shift_file_index(
             .map_err(|error| error.to_string())?;
     }
     Ok(shifted)
+}
+
+/// Lowering numbers anonymous static shared allocations independently in each
+/// module. Their generated names are not cross-bundle linkage identities.
+/// Namespace declarations and references before callable deduplication, so
+/// functions using different shared storage cannot be silently conflated.
+fn namespace_static_shared(ptx: &str, bundle: usize) -> Result<String, String> {
+    use ptx_parse::{ScopeId, StatementKind, TokenKind};
+    let document = ptx_parse::Document::parse(ptx).map_err(|error| error.to_string())?;
+    let mut names = HashMap::new();
+    let mut declarations = Vec::new();
+    for statement in document.statements() {
+        if statement.kind() != StatementKind::Directive { continue; }
+        let span = statement.span();
+        let tokens = document.tokens();
+        let first = tokens.partition_point(|token| token.span().start < span.start);
+        let words = tokens[first..].iter()
+            .take_while(|token| token.span().end <= span.end)
+            .filter(|token| token.kind() == TokenKind::Word)
+            .map(|token| token.text(ptx)).collect::<Vec<_>>();
+        let anonymous = words.iter().find(|name| name.strip_prefix("__shared_mem_")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())));
+        let Some(&name) = anonymous else { continue };
+        if statement.scope() == ScopeId::ROOT {
+            if words.contains(&".shared") && !words.contains(&".extern") {
+                names.insert(name, format!("__cuda_oxide_bundle_{bundle}_{name}"));
+            }
+        } else {
+            // A locally declared symbol shadows a module global of the same
+            // spelling. Leave that declaration and its lexical scope alone.
+            declarations.push((name, statement.scope()));
+        }
+    }
+    let mut edits = ptx_parse::EditScript::new();
+    for token in document.tokens() {
+        if token.kind() != TokenKind::Word { continue; }
+        let name = token.text(ptx);
+        let Some(replacement) = names.get(name) else { continue };
+        if declarations.iter().any(|(local, scope)| *local == name
+            && document.scope(*scope).expect("parsed scope").body_span().contains(&token.span().start)) {
+            continue;
+        }
+        edits.replace(token.span(), replacement.clone()).map_err(|error| error.to_string())?;
+    }
+    edits.apply(ptx).map_err(|error| error.to_string())
 }
 
 /// Delete callable definitions already contributed by an earlier bundle.
@@ -791,6 +842,7 @@ $L__BB33_2:                 // %bb7
     }
 
     #[test]
+<<<<<<< HEAD:cuda-oxide/crates/cuda-host/src/embedded.rs
     fn merge_deduplicates_functions_with_remapped_debug_locations() {
         let first = ptx_bundle(
             "first",
@@ -804,6 +856,58 @@ $L__BB33_2:                 // %bb7
         assert_eq!(merged.matches(".func shared()").count(), 1);
         assert!(merged.contains(".file 2 \"b.rs\""));
         assert!(merged.contains(".loc 1 2 3"));
+=======
+    fn merge_namespaces_anonymous_shared_declarations_and_references() {
+        let source = "\
+.visible .shared .align 16 .b8 __shared_mem_0[4096];
+.visible .shared .align 32 .b8 __shared_mem_10[33856];
+.extern .shared .align 16 .b8 dynamic[];
+.visible .entry first() {
+    // __shared_mem_0 is a comment, not a reference.
+    mov.u64 %rd1, __shared_mem_0;
+    ld.shared.u32 %r1, [__shared_mem_10+32];
+    ret;
+}
+";
+        let first = namespace_static_shared(source, 0).unwrap();
+        let second = namespace_static_shared(
+            &source.replace("[4096]", "[32768]").replace("first()", "second()"), 1).unwrap();
+        assert!(first.contains(".b8 __cuda_oxide_bundle_0___shared_mem_0[4096]"));
+        assert!(first.contains("mov.u64 %rd1, __cuda_oxide_bundle_0___shared_mem_0;"));
+        assert!(first.contains("[__cuda_oxide_bundle_0___shared_mem_10+32]"));
+        assert!(first.contains("// __shared_mem_0 is a comment"));
+        assert!(first.contains(".b8 dynamic[];"));
+        assert!(second.contains(".b8 __cuda_oxide_bundle_1___shared_mem_0[32768]"));
+        let mut definitions = HashMap::new();
+        drop_duplicate_definitions(&first, "a", &mut definitions).unwrap();
+        drop_duplicate_definitions(&second, "b", &mut definitions).unwrap();
+        // Equal callable text with different static storage is not deduplicated.
+        let conflict = namespace_static_shared(source, 2).unwrap();
+        assert!(drop_duplicate_definitions(&conflict, "c", &mut definitions).is_err());
+    }
+
+    #[test]
+    fn merge_preserves_local_shadows_and_explicit_linkage_names() {
+        let source = "\
+.shared .b8 __shared_mem_0[16];
+.shared .b8 named_storage[16];
+.visible .entry first() {
+    mov.u64 %rd1, __shared_mem_0;
+    {
+        .shared .b8 __shared_mem_0[8];
+        mov.u64 %rd2, __shared_mem_0;
+    }
+    mov.u64 %rd3, __shared_mem_0;
+    ret;
+}
+";
+        let rewritten = namespace_static_shared(source, 3).unwrap();
+        assert!(rewritten.contains(".shared .b8 named_storage[16];"));
+        assert!(rewritten.contains(".shared .b8 __shared_mem_0[8];"));
+        assert!(rewritten.contains("mov.u64 %rd2, __shared_mem_0;"));
+        assert!(rewritten.contains("mov.u64 %rd1, __cuda_oxide_bundle_3___shared_mem_0;"));
+        assert!(rewritten.contains("mov.u64 %rd3, __cuda_oxide_bundle_3___shared_mem_0;"));
+>>>>>>> c53311d38 (Namespace anonymous static shared globals in merged PTX):crates/cuda-host/src/embedded.rs
     }
 
     #[test]
