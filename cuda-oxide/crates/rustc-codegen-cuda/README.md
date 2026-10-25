@@ -175,6 +175,7 @@ The `examples/` directory contains standalone kernel crates that exercise differ
 | `vecadd`                     | Basic vector addition -- the "hello world" kernel          |
 | `generic`                    | Generic kernels (`scale<T>`)                               |
 | `ord_cmp`                    | Device-side `Ord::cmp` for signed and unsigned integers    |
+| `wide_integer_bits`           | u128/i128 shifts and bitwise operations, including dynamic lane masks |
 | `manual_launch_generic`      | Lower-level generic launch API regression                  |
 | `cuda_module_contract`       | Typed launch ABI argument marshalling                      |
 | `abi_hmm`                    | HMM pointers, struct layout, closures                      |
@@ -217,6 +218,14 @@ cargo oxide run <example_name>
 # (MIR → dialect-mir → LLVM dialect → LLVM IR → PTX)
 cargo oxide pipeline <example_name>
 ```
+
+`wide_integer_bits` compares GPU results against host Rust for every shift
+count from 0 through 127, plus lane-derived counts (`lane * 64`). The latter
+guards against LLVM NVPTX wide-shift legalization incorrectly setting the high
+half of `u64::MAX << 0` when the count's low six bits are known zero. Wide
+shifts are lowered to two i64 halves with in-range counts and an explicit
+zero-count carry. Run the default PTX path to exercise this regression;
+`--emit-nvvm-ir` additionally checks libNVVM's independent compilation path.
 
 ## Key Design Decisions
 

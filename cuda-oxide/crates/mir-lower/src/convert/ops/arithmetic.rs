@@ -35,7 +35,9 @@ use llvm_export::attributes::{
     FCmpPredicateAttr, FastmathFlags, FastmathFlagsAttr, ICmpPredicateAttr,
     IntegerOverflowFlagsAttr,
 };
-use llvm_export::op_interfaces::{BinArithOp, CastOpInterface, IntBinArithOpWithOverflowFlag};
+use llvm_export::op_interfaces::{
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+};
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
 use pliron::builtin::attributes::IntegerAttr;
@@ -436,13 +438,12 @@ pub(crate) fn convert_shr(
     operands_info: &OperandsInfo,
 ) -> Result<()> {
     let signed = is_signed_int_op(ctx, op, operands_info)?;
-    convert_shift(ctx, rewriter, op, |ctx, lhs, rhs| {
-        if signed {
-            llvm::AShrOp::new(ctx, lhs, rhs).get_operation()
-        } else {
-            llvm::LShrOp::new(ctx, lhs, rhs).get_operation()
-        }
-    })
+    convert_shift(
+        ctx,
+        rewriter,
+        op,
+        if signed { ShiftKind::ArithmeticRight } else { ShiftKind::LogicalRight },
+    )
 }
 
 /// Convert `mir.shl` to `llvm.shl` (shift left).
@@ -455,15 +456,31 @@ pub(crate) fn convert_shl(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    convert_shift(ctx, rewriter, op, |ctx, lhs, rhs| {
-        let shl_op = llvm::ShlOp::new(ctx, lhs, rhs);
-        let flags = IntegerOverflowFlagsAttr::default();
-        shl_op.get_operation().deref_mut(ctx).attributes.set(
-            llvm_export::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(),
-            flags,
-        );
-        shl_op.get_operation()
-    })
+    convert_shift(ctx, rewriter, op, ShiftKind::Left)
+}
+
+#[derive(Clone, Copy)]
+enum ShiftKind {
+    Left,
+    LogicalRight,
+    ArithmeticRight,
+}
+
+impl ShiftKind {
+    fn build(self, ctx: &mut Context, lhs: Value, rhs: Value) -> Ptr<Operation> {
+        match self {
+            Self::Left => {
+                let op = llvm::ShlOp::new(ctx, lhs, rhs).get_operation();
+                op.deref_mut(ctx).attributes.set(
+                    llvm_export::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(),
+                    IntegerOverflowFlagsAttr::default(),
+                );
+                op
+            }
+            Self::LogicalRight => llvm::LShrOp::new(ctx, lhs, rhs).get_operation(),
+            Self::ArithmeticRight => llvm::AShrOp::new(ctx, lhs, rhs).get_operation(),
+        }
+    }
 }
 
 /// Common shift operation converter with Rust-compatible count handling.
@@ -473,15 +490,12 @@ pub(crate) fn convert_shl(
 /// (trunc) of the shift amount to match, then masks it with `bit_width - 1`.
 /// That matches Rust's unchecked/release shift behavior and avoids LLVM poison
 /// for oversized counts.
-fn convert_shift<F>(
+fn convert_shift(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    builder: F,
-) -> Result<()>
-where
-    F: FnOnce(&mut Context, Value, Value) -> Ptr<Operation>,
-{
+    kind: ShiftKind,
+) -> Result<()> {
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
 
     let lhs_ty = lhs.get_type(ctx);
@@ -521,10 +535,116 @@ where
     };
 
     let rhs_masked = mask_shift_amount(ctx, rewriter, rhs_casted, lhs_ty, lhs_width);
-    let llvm_op = builder(ctx, lhs, rhs_masked);
-    rewriter.insert_operation(ctx, llvm_op);
-    rewriter.replace_operation(ctx, op, llvm_op);
+    if lhs_width == 128 {
+        let result = split_wide_shift(ctx, rewriter, lhs, rhs_masked, kind);
+        rewriter.replace_operation(ctx, op, result);
+    } else {
+        let llvm_op = kind.build(ctx, lhs, rhs_masked);
+        rewriter.insert_operation(ctx, llvm_op);
+        rewriter.replace_operation(ctx, op, llvm_op);
+    }
     Ok(())
+}
+
+/// Legalize wide shifts before LLVM's NVPTX integer expansion. Its known-bits
+/// folding can turn the high half of `u64::MAX << (lane * 64)` into all ones
+/// at shift zero. Keep every variable i64 count below 64, including the
+/// cross-half carry, so neither LLVM poison nor target shift semantics leak
+/// into a valid Rust i128 shift.
+fn split_wide_shift(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    value: Value,
+    amount: Value,
+    kind: ShiftKind,
+) -> Ptr<Operation> {
+    use pliron::utils::apint::APInt;
+    use std::num::NonZeroUsize;
+
+    fn emit(ctx: &Context, rw: &mut DialectConversionRewriter, op: Ptr<Operation>) -> Value {
+        rw.insert_operation(ctx, op);
+        op.deref(ctx).get_result(0)
+    }
+    fn constant(ctx: &mut Context, rw: &mut DialectConversionRewriter, width: u32, bits: u64) -> Value {
+        let ty = IntegerType::get(ctx, width, Signedness::Signless);
+        let attr = IntegerAttr::new(ty, APInt::from_u64(bits, NonZeroUsize::new(width as usize).unwrap()));
+        let op = llvm::ConstantOp::new(ctx, attr.into()).get_operation();
+        emit(ctx, rw, op)
+    }
+    fn shift(ctx: &mut Context, rw: &mut DialectConversionRewriter, kind: ShiftKind, a: Value, b: Value) -> Value {
+        let op = kind.build(ctx, a, b);
+        emit(ctx, rw, op)
+    }
+    fn select(ctx: &mut Context, rw: &mut DialectConversionRewriter, cond: Value, a: Value, b: Value) -> Value {
+        let op = llvm::SelectOp::new(ctx, cond, a, b).get_operation();
+        emit(ctx, rw, op)
+    }
+    fn or(ctx: &mut Context, rw: &mut DialectConversionRewriter, a: Value, b: Value) -> Value {
+        let op = llvm::OrOp::new(ctx, a, b).get_operation();
+        emit(ctx, rw, op)
+    }
+
+    let wide_ty = value.get_type(ctx);
+    let half_ty = IntegerType::get(ctx, 64, Signedness::Signless).into();
+    let sixty_four = constant(ctx, rewriter, 128, 64);
+    let high_wide = shift(ctx, rewriter, ShiftKind::LogicalRight, value, sixty_four);
+    let low_op = llvm::TruncOp::new(ctx, value, half_ty).get_operation();
+    let low = emit(ctx, rewriter, low_op);
+    let high_op = llvm::TruncOp::new(ctx, high_wide, half_ty).get_operation();
+    let high = emit(ctx, rewriter, high_op);
+    let amount_op = llvm::TruncOp::new(ctx, amount, half_ty).get_operation();
+    let amount = emit(ctx, rewriter, amount_op);
+    let zero = constant(ctx, rewriter, 64, 0);
+    let mask = constant(ctx, rewriter, 64, 63);
+    let count_op = llvm::AndOp::new(ctx, amount, mask).get_operation();
+    let count = emit(ctx, rewriter, count_op);
+    let neg_op = llvm::SubOp::new_with_overflow_flag(
+        ctx, zero, count, IntegerOverflowFlagsAttr::default(),
+    ).get_operation();
+    let neg = emit(ctx, rewriter, neg_op);
+    let reverse_op = llvm::AndOp::new(ctx, neg, mask).get_operation();
+    let reverse = emit(ctx, rewriter, reverse_op);
+    let is_zero_op = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::EQ, count, zero).get_operation();
+    let is_zero = emit(ctx, rewriter, is_zero_op);
+    let is_wide_op = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::UGT, amount, mask).get_operation();
+    let is_wide = emit(ctx, rewriter, is_wide_op);
+
+    let (low, high) = match kind {
+        ShiftKind::Left => {
+            let carry = shift(ctx, rewriter, ShiftKind::LogicalRight, low, reverse);
+            let carry = select(ctx, rewriter, is_zero, zero, carry);
+            let low_shifted = shift(ctx, rewriter, kind, low, count);
+            let high_shifted = shift(ctx, rewriter, kind, high, count);
+            let high_small = or(ctx, rewriter, high_shifted, carry);
+            (
+                select(ctx, rewriter, is_wide, zero, low_shifted),
+                select(ctx, rewriter, is_wide, low_shifted, high_small),
+            )
+        }
+        ShiftKind::LogicalRight | ShiftKind::ArithmeticRight => {
+            let carry = shift(ctx, rewriter, ShiftKind::Left, high, reverse);
+            let carry = select(ctx, rewriter, is_zero, zero, carry);
+            let low_shifted = shift(ctx, rewriter, ShiftKind::LogicalRight, low, count);
+            let low_small = or(ctx, rewriter, low_shifted, carry);
+            let high_shifted = shift(ctx, rewriter, kind, high, count);
+            let fill = match kind {
+                ShiftKind::ArithmeticRight => shift(ctx, rewriter, kind, high, mask),
+                _ => zero,
+            };
+            (
+                select(ctx, rewriter, is_wide, high_shifted, low_small),
+                select(ctx, rewriter, is_wide, fill, high_shifted),
+            )
+        }
+    };
+    let low_op = llvm::ZExtOp::new_with_nneg(ctx, low, wide_ty, false).get_operation();
+    let low = emit(ctx, rewriter, low_op);
+    let high_op = llvm::ZExtOp::new_with_nneg(ctx, high, wide_ty, false).get_operation();
+    let high = emit(ctx, rewriter, high_op);
+    let high = shift(ctx, rewriter, ShiftKind::Left, high, sixty_four);
+    let result = llvm::OrOp::new(ctx, low, high).get_operation();
+    rewriter.insert_operation(ctx, result);
+    result
 }
 
 fn mask_shift_amount(
