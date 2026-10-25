@@ -29,7 +29,7 @@ jobs:
         continue-on-error: true
         env:
           RCCL_UPSTREAM_REPORT: /tmp/rccl-upstream-report.md
-        run: scripts/check-rccl-upstream.sh upstream/main HEAD
+        run: cuda-oxide/scripts/check-rccl-upstream.sh upstream/main HEAD
       - name: Publish or update review issue
         env:
           GH_TOKEN: ${{ github.token }}

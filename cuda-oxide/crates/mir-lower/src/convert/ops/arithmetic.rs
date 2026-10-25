@@ -568,7 +568,7 @@ fn split_wide_shift(
     fn constant(ctx: &mut Context, rw: &mut DialectConversionRewriter, width: u32, bits: u64) -> Value {
         let ty = IntegerType::get(ctx, width, Signedness::Signless);
         let attr = IntegerAttr::new(ty, APInt::from_u64(bits, NonZeroUsize::new(width as usize).unwrap()));
-        let op = llvm::ConstantOp::new(ctx, attr.into()).get_operation();
+        let op = llvm::ConstantOp::new(ctx, Box::new(attr)).get_operation();
         emit(ctx, rw, op)
     }
     fn shift(ctx: &mut Context, rw: &mut DialectConversionRewriter, kind: ShiftKind, a: Value, b: Value) -> Value {

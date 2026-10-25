@@ -264,6 +264,16 @@ pub fn emit_read_only_load(
         })?
         .pointee;
 
+    let (prepared_destination, last_op) = helpers::prepare_destination_write(
+        ctx,
+        body,
+        destination,
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+
     let load_op = Operation::new(
         ctx,
         MirLoadOp::get_concrete_op_info(),
@@ -280,9 +290,9 @@ pub fn emit_read_only_load(
     }
 
     let result = load_op.deref(ctx).get_result(0);
-    emit_store_result_and_goto(
+    helpers::emit_prepared_result_and_goto(
         ctx,
-        destination,
+        prepared_destination,
         result,
         target,
         block_ptr,
@@ -373,6 +383,15 @@ pub fn emit_read_only_load_at(
     }
 
     let address = offset.deref(ctx).get_result(0);
+    let (prepared_destination, last_op) = helpers::prepare_destination_write(
+        ctx,
+        body,
+        destination,
+        value_map,
+        block_ptr,
+        Some(offset),
+        loc.clone(),
+    )?;
     let load = Operation::new(
         ctx,
         MirLoadOp::get_concrete_op_info(),
@@ -383,12 +402,12 @@ pub fn emit_read_only_load_at(
     );
     load.deref_mut(ctx).set_loc(loc.clone());
     MirLoadOp::new(load).set_read_only(ctx, true);
-    load.insert_after(ctx, offset);
+    load.insert_after(ctx, last_op.expect("offset precedes the read-only load"));
 
     let result = load.deref(ctx).get_result(0);
-    emit_store_result_and_goto(
+    helpers::emit_prepared_result_and_goto(
         ctx,
-        destination,
+        prepared_destination,
         result,
         target,
         block_ptr,

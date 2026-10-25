@@ -332,7 +332,7 @@ fn convert_read_only_i32x4(
             std::num::NonZeroUsize::new(64).expect("64 is nonzero"),
         ),
     );
-    let shift = llvm::ConstantOp::new(ctx, shift_attr.into());
+    let shift = llvm::ConstantOp::new(ctx, Box::new(shift_attr));
     rewriter.insert_operation(ctx, shift.get_operation());
     let shift = shift.get_operation().deref(ctx).get_result(0);
 

@@ -7,7 +7,7 @@
 //! Inputs and counts come from device buffers, preventing constant folding.
 //! Run: cargo oxide run wide_integer_bits --arch sm_89
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, DeviceBuffer, simt::LaunchConfig};
 use cuda_device::{DisjointSlice, cuda_module, kernel};
 
 const OPS: usize = 14;

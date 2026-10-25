@@ -1,4 +1,4 @@
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, DeviceBuffer, simt::LaunchConfig};
 use cuda_device::cuda_module;
 
 #[cuda_module]

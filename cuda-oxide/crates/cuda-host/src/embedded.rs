@@ -842,7 +842,6 @@ $L__BB33_2:                 // %bb7
     }
 
     #[test]
-<<<<<<< HEAD:cuda-oxide/crates/cuda-host/src/embedded.rs
     fn merge_deduplicates_functions_with_remapped_debug_locations() {
         let first = ptx_bundle(
             "first",
@@ -856,7 +855,9 @@ $L__BB33_2:                 // %bb7
         assert_eq!(merged.matches(".func shared()").count(), 1);
         assert!(merged.contains(".file 2 \"b.rs\""));
         assert!(merged.contains(".loc 1 2 3"));
-=======
+    }
+
+    #[test]
     fn merge_namespaces_anonymous_shared_declarations_and_references() {
         let source = "\
 .visible .shared .align 16 .b8 __shared_mem_0[4096];
@@ -907,7 +908,6 @@ $L__BB33_2:                 // %bb7
         assert!(rewritten.contains("mov.u64 %rd2, __shared_mem_0;"));
         assert!(rewritten.contains("mov.u64 %rd1, __cuda_oxide_bundle_3___shared_mem_0;"));
         assert!(rewritten.contains("mov.u64 %rd3, __cuda_oxide_bundle_3___shared_mem_0;"));
->>>>>>> c53311d38 (Namespace anonymous static shared globals in merged PTX):crates/cuda-host/src/embedded.rs
     }
 
     #[test]
