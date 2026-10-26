@@ -144,9 +144,12 @@ artifact but does not give sibling targets separate runtime bundle names.
 
 `cargo oxide build --materialize-cubin --arch sm_XX` finalizes device code
 with the wrapper's provenance-checked libNVVM and nvJitLink tools. Each
-device crate embeds an anchored native cubin plus its linkable compiler IR.
-Rlibs and static libraries retain those inputs without performing a final
-whole-program device link.
+device crate emits two objects: an anchored, Cubin-only runtime bundle and
+an unanchored, compile-only NVVM IR/LTOIR bundle. The IR object's `.oxart`
+section uses ELF `SHF_EXCLUDE`: rlibs and static libraries retain it, but
+the host linker removes it from executable/shared-library images, including
+whole-archive links and simultaneous rlib/shared-library outputs. Runtime
+artifact discovery therefore never reads or copies the retained build IR.
 
 When rustc links an executable or shared library, the backend gathers local
 objects and dependency rlib members (including members not selected by the
@@ -158,9 +161,13 @@ Generic module loading uses this final image, including specializations
 emitted by consumer crates, instead of merging PTX at runtime. Ordinary
 anchored module loading continues to use each crate's native cubin.
 
-All linked device bundles must carry compatible architecture and compile
-policies and retain NVVM IR or LTOIR. Rebuild every device dependency under
-the same materialization settings; PTX-only or cubin-only inputs fail closed.
+All linked device inputs must carry compatible architecture and compile
+policies. Each runtime cubin is paired with its compile-only input by the
+target-specific artifact anchor identity, with matching entry metadata,
+target and policy required. Rebuild every device dependency under the same
+materialization settings; missing IR partners, old combined-payload bundles,
+and unmaterialized inputs fail closed. Linking from a dependency rlib is
+required when its shared-library image no longer contains the build inputs.
 `#[device] extern` inputs remain unsupported because their external link
 inputs are not available to this backend. Materialization requires the
 `cargo oxide` provenance handshake and produces architecture-specific

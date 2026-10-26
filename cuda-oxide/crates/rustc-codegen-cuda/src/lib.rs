@@ -371,6 +371,7 @@ pub struct CudaCodegenBackend {
 struct CudaOngoingCodegen {
     host: Box<dyn Any>,
     artifact_objects: Vec<PathBuf>,
+    link_input_objects: Vec<PathBuf>,
 }
 
 static ARTIFACT_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -671,6 +672,7 @@ impl CodegenBackend for CudaCodegenBackend {
                 contains_device_code,
             );
             let mut artifact_objects = Vec::new();
+            let mut link_input_objects = Vec::new();
 
             if self.config.verbose && contains_device_code && !owner_selected {
                 eprintln!(
@@ -868,7 +870,7 @@ impl CodegenBackend for CudaCodegenBackend {
                                     device_functions,
                                     materialization_request,
                             ) {
-                                Ok(path) => {
+                                Ok((path, link_input)) => {
                                     if self.config.verbose {
                                         eprintln!(
                                             "[rustc_codegen_cuda] Embedded artifact object complete: {}",
@@ -876,6 +878,7 @@ impl CodegenBackend for CudaCodegenBackend {
                                         );
                                     }
                                     artifact_objects.push(path);
+                                    link_input_objects.extend(link_input);
                                 }
                                 Err(e) => {
                                     tcx.dcx().fatal(format!(
@@ -934,6 +937,7 @@ impl CodegenBackend for CudaCodegenBackend {
             Box::new(CudaOngoingCodegen {
                 host: host_result,
                 artifact_objects,
+                link_input_objects,
             })
         })
     }
@@ -956,9 +960,15 @@ impl CodegenBackend for CudaCodegenBackend {
             outputs,
             crate_info,
         );
-        for (index, object) in ongoing.artifact_objects.into_iter().enumerate() {
+        let objects = ongoing.artifact_objects.into_iter().map(|path| (false, path))
+            .chain(ongoing.link_input_objects.into_iter().map(|path| (true, path)));
+        for (index, (link_only, object)) in objects.enumerate() {
             compiled_modules.modules.push(CompiledModule {
-                name: format!("oxide_artifact_embed_{index}"),
+                name: if link_only {
+                    format!("{}{index}", aot_link::LINK_INPUT_MODULE_PREFIX)
+                } else {
+                    format!("oxide_artifact_embed_{index}")
+                },
                 kind: ModuleKind::Regular,
                 object: Some(object),
                 dwarf_object: None,
@@ -1069,7 +1079,7 @@ fn write_device_artifact_object(
     artifact: &device_codegen::DeviceCodegenArtifact,
     functions: &[collector::CollectedFunction<'_>],
     materialization_request: Option<materialize::MaterializationRequest>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, Option<PathBuf>), Box<dyn std::error::Error>> {
     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
     let materialized_artifact = materialize_artifact_for_embedding(
         materialization_request,
@@ -1118,9 +1128,7 @@ fn write_device_artifact_object(
             &artifact.name,
             &artifact.bytes,
         ));
-    // Keep compiler IR next to the anchored per-crate image. Final host
-    // linking gathers these inputs even from unextracted rlib members.
-    if let Some(input) = link_input {
+    let link_payload = link_input.map(|input| {
         let kind = match input.kind {
             device_codegen::DeviceCodegenArtifactKind::NvvmIr => {
                 oxide_artifacts::ArtifactPayloadKind::NvvmIr
@@ -1130,12 +1138,8 @@ fn write_device_artifact_object(
             }
             _ => unreachable!("materialization accepts only compiler IR"),
         };
-        spec = spec.with_payload(oxide_artifacts::ArtifactPayloadSpec::new(
-            kind,
-            &input.name,
-            &input.bytes,
-        ));
-    }
+        oxide_artifacts::ArtifactPayloadSpec::new(kind, &input.name, &input.bytes)
+    });
     for function in functions {
         let kind = if function.is_kernel {
             oxide_artifacts::ArtifactEntryKind::Kernel
@@ -1148,7 +1152,6 @@ fn write_device_artifact_object(
         ));
     }
 
-    let blob = oxide_artifacts::build_artifact_blob(&spec)?;
     // Define a link-anchor symbol at the start of the `.oxart` data. When
     // this crate is a library, the artifact object becomes an rlib archive
     // member, and the linker only extracts it if some other object holds an
@@ -1169,13 +1172,16 @@ fn write_device_artifact_object(
         output_name,
         binary_name.as_deref(),
     );
-    let object = oxide_artifacts::build_host_object_for_target_with_legacy_anchor(
-        &blob,
-        host_target,
-        &target_anchor,
-        &legacy_anchor,
+    let (object, input_object) = aot_link::build_artifact_objects(
+        spec, link_payload, host_target, &target_anchor, &legacy_anchor,
     )?;
-    write_artifact_object(output_dir, output_name, host_target, &object, "embed")
+    let runtime_path = write_artifact_object(
+        output_dir, output_name, host_target, &object, "embed",
+    )?;
+    let input_path = input_object.as_ref().map(|object| {
+        write_artifact_object(output_dir, output_name, host_target, object, "link-input")
+    }).transpose()?;
+    Ok((runtime_path, input_path))
 }
 
 fn embedded_compile_options(
