@@ -121,9 +121,11 @@ rechecks them inside the backend; use the wrapper flag instead of setting
 `CUDA_OXIDE_MATERIALIZE_CUBIN` around raw Cargo. That variable is an internal
 wrapper/backend signal, not a supported user interface: raw Cargo may reuse a
 previous artifact without running the backend, and a backend invocation without
-the wrapper's fingerprint is rejected. Generic `#[cuda_module]` kernels and
-`#[device] extern` declarations are rejected because their run-time
-multi-artifact linking is not yet represented by this single-cubin path.
+the wrapper's fingerprint is rejected. Generic `#[cuda_module]` kernels use an
+additional build-time device link across local and dependency artifacts; their
+loader selects the linked cubin without runtime PTX merging. `#[device] extern`
+declarations remain rejected because their external link inputs are not yet
+represented by this path.
 Metadata-interop projects keep rejecting this global flag; they can instead
 request one independently finalized cubin per declared device crate with
 `artifact-kind = "cubin"`, as described below. Materialization is also a

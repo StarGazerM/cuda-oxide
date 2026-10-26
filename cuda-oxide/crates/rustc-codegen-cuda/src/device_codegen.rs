@@ -345,6 +345,8 @@ pub struct DeviceCodegenArtifact {
 ///
 /// Controls output paths and diagnostic output during compilation.
 pub struct DeviceCodegenConfig {
+    /// Emit coalescible definitions for the validated build-time device link.
+    pub aot_device_link: bool,
     /// Output directory for generated files (.ll, .ptx).
     pub output_dir: PathBuf,
     /// Base name for output files (e.g., "kernel" → kernel.ll, kernel.ptx).
@@ -366,6 +368,7 @@ pub struct DeviceCodegenConfig {
 impl Default for DeviceCodegenConfig {
     fn default() -> Self {
         Self {
+            aot_device_link: false,
             output_dir: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             output_name: "kernel".to_string(),
             mlir_output: None,
@@ -1252,6 +1255,7 @@ pub fn generate_device_code<'tcx>(
 
         // Create pipeline config
         let pipeline_config = mir_importer::PipelineConfig {
+            aot_device_link: config.aot_device_link,
             output_dir: output_dir.clone(),
             output_name: output_name.clone(),
             mlir_output: mlir_output.clone(),

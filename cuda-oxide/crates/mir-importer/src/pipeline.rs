@@ -185,6 +185,8 @@ pub struct CompilationResult {
 
 /// Configuration for the compilation pipeline.
 pub struct PipelineConfig {
+    /// Coalesce repeated collector definitions at the final AOT device link.
+    pub aot_device_link: bool,
     /// Directory for output files (`.ll`, `.ptx`).
     pub output_dir: std::path::PathBuf,
     /// Base name for output files (e.g., `"kernel"` → `kernel.ll`, `kernel.ptx`).
@@ -268,6 +270,7 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            aot_device_link: false,
             output_dir: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             output_name: "kernel".to_string(),
             mlir_output: None,
@@ -456,6 +459,7 @@ fn backend_options_for(config: &PipelineConfig) -> BackendOptions {
     backend_options.verbose = backend_options.verbose || config.verbose;
     backend_options.no_fma = !config.allow_fma_contraction;
     backend_options.module_disambiguator = config.module_disambiguator;
+    backend_options.aot_device_link = config.aot_device_link;
     backend_options
 }
 
@@ -1331,6 +1335,7 @@ fn adversarial_export_name() -> u64 {
         fs::write(&cached_cubin, b"persistent cache entry").unwrap();
 
         let config = PipelineConfig {
+            aot_device_link: false,
             output_dir: root.clone(),
             output_name: "kernel".to_string(),
             mlir_output: None,
@@ -1387,6 +1392,7 @@ fn adversarial_export_name() -> u64 {
         assert!(!output_dir.exists());
 
         let config = PipelineConfig {
+            aot_device_link: false,
             output_dir: output_dir.clone(),
             output_name: "empty".to_string(),
             mlir_output: None,
@@ -1481,6 +1487,7 @@ fn adversarial_export_name() -> u64 {
             unique
         ));
         let config = PipelineConfig {
+            aot_device_link: false,
             output_dir: root.clone(),
             output_name: "extern_only".to_string(),
             mlir_output: None,
@@ -1518,6 +1525,14 @@ fn adversarial_export_name() -> u64 {
         );
 
         fs::remove_dir_all(&root).expect("clean up temp output dir");
+    }
+
+    #[test]
+    fn aot_device_link_requires_explicit_frontend_configuration() {
+        let mut config = PipelineConfig::default();
+        assert!(!backend_options_for(&config).aot_device_link);
+        config.aot_device_link = true;
+        assert!(backend_options_for(&config).aot_device_link);
     }
 
     #[test]

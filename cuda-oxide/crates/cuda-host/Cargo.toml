@@ -20,6 +20,7 @@ cuda-artifact-finalizer = { workspace = true }
 ptx-parse = { workspace = true }
 sha2 = { workspace = true }
 oxide-artifacts = { workspace = true, features = ["object-read"] }
+reserved-oxide-symbols = { workspace = true }
 thiserror = { workspace = true }
 cuda-async = { workspace = true, optional = true }
 

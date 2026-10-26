@@ -1146,6 +1146,9 @@ impl<'a> ModuleExportState<'a> {
             }
 
             write!(output, "define ").unwrap();
+            if self.weak_odr_functions {
+                write!(output, "weak_odr ").unwrap();
+            }
             if is_kernel && self.emit_ptx_kernel_keyword {
                 write!(output, "ptx_kernel ").unwrap();
             }

@@ -121,6 +121,8 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) grid_constant_kernels: Vec<KernelGridConstants>,
     /// Whether to print `ptx_kernel` on kernel definitions.
     pub(super) emit_ptx_kernel_keyword: bool,
+    /// Equivalent cross-crate function definitions are resolved by the device linker.
+    pub(super) weak_odr_functions: bool,
     /// Track device function names for @llvm.used (standalone device fn compilation)
     pub(super) device_functions: Vec<String>,
     /// Defined globals retain external linkage because CUDA host code can
@@ -247,6 +249,7 @@ impl<'a> ModuleExportState<'a> {
             function_abi_alignments: Vec::new(),
             grid_constant_kernels: Vec::new(),
             emit_ptx_kernel_keyword,
+            weak_odr_functions: false,
             device_functions: Vec::new(),
             public_globals: Vec::new(),
             retained_globals: Vec::new(),

@@ -63,6 +63,9 @@ pub const CODEGEN_FINGERPRINT_ENV: &str = "CUDA_OXIDE_INTERNAL_CODEGEN_FINGERPRI
 /// Internal cargo-oxide/backend opt-in for build-time cubin materialization.
 pub const MATERIALIZE_CUBIN_ENV: &str = "CUDA_OXIDE_MATERIALIZE_CUBIN";
 
+/// Final executable/shared-library device image produced by the AOT linker.
+pub const LINKED_CUBIN_BUNDLE_NAME: &str = "__cuda_oxide_linked";
+
 /// Exact CUDA compiler/linker provenance discovered by cargo-oxide and checked
 /// again by the codegen backend before materialization.
 pub const MATERIALIZER_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_MATERIALIZER_PROVENANCE";
@@ -200,17 +203,6 @@ pub const KERNEL_SCOPE_LOCAL: &str = "cuda_oxide_kernel_scope_246e25db";
 /// linker to pull the artifact member out of the archive.
 pub const ARTIFACT_ANCHOR_PREFIX: &str = "cuda_oxide_artifact_anchor_246e25db_";
 
-/// Prefix of private statics emitted by `#[cuda_module]` for enabled generic
-/// kernels.
-///
-/// Generic kernel specializations can be emitted into a downstream crate's
-/// device artifact, so loading only the defining crate's artifact is not
-/// sufficient. The host API therefore merges PTX bundles for such modules.
-/// Ahead-of-time cubin materialization cannot preserve that behavior today;
-/// the codegen collector uses this marker to reject the unsupported case
-/// before loading libNVVM or nvJitLink.
-pub const PTX_MERGE_REQUIRED_PREFIX: &str = "cuda_oxide_ptx_merge_required_246e25db_";
-
 /// Indexed LLVM operation-attribute key carrying proven kernel reference
 /// validity. This is compiler metadata, not a mangled link symbol.
 pub const KERNEL_REFERENCE_PARAM_VALIDITY_KEY_PREFIX: &str =
@@ -294,13 +286,6 @@ pub fn constant_symbol(base: &str) -> String {
 /// ```
 pub fn tile_export_meta_symbol(base: &str) -> String {
     format!("{TILE_EXPORT_META_PREFIX}{base}")
-}
-
-/// Build the compiler marker associated with one generic kernel.
-pub fn ptx_merge_required_marker(base: &str) -> String {
-    let mut symbol = String::from(PTX_MERGE_REQUIRED_PREFIX);
-    push_symbol_sanitized(&mut symbol, base);
-    symbol
 }
 
 /// Build the operation-attribute key for one physical kernel parameter.
@@ -448,14 +433,6 @@ pub fn is_device_extern_symbol(name: &str) -> bool {
     name.contains(DEVICE_EXTERN_PREFIX)
 }
 
-/// Returns `true` for a generic-kernel PTX-merge marker path.
-pub fn is_ptx_merge_required_marker(name: &str) -> bool {
-    name.rsplit("::")
-        .next()
-        .and_then(|component| component.strip_prefix(PTX_MERGE_REQUIRED_PREFIX))
-        .is_some_and(|base| !base.is_empty())
-}
-
 /// Extract the parameter-index text from a reference-validity attribute key.
 ///
 /// Preserve malformed or empty suffixes so the compiler can diagnose invalid
@@ -492,10 +469,9 @@ pub fn is_constant_symbol(name: &str) -> bool {
 /// Returns `true` if the last path component of `name` is a `#[tile_export]`
 /// metadata function.
 ///
-/// Matches the final `::` component only, like
-/// [`is_ptx_merge_required_marker`]: the backend looks these functions up by
-/// definition path, and an enclosing module named after the prefix must not
-/// turn its contents into metadata functions.
+/// Matches the final `::` component only: the backend looks these functions
+/// up by definition path, and an enclosing module named after the prefix must
+/// not turn its contents into metadata functions.
 ///
 /// ```
 /// use reserved_oxide_symbols::{is_tile_export_meta_symbol, tile_export_meta_symbol};
@@ -797,22 +773,6 @@ mod tests {
         assert!(!is_tile_export_meta_symbol(&format!("{meta}::child")));
         assert!(!is_tile_export_meta_symbol(&format!("prefix_{meta}")));
         assert!(!is_tile_export_meta_symbol(TILE_EXPORT_META_PREFIX));
-    }
-
-    #[test]
-    fn ptx_merge_markers_are_per_kernel_and_sanitized() {
-        let marker = ptx_merge_required_marker("nested::map-value");
-        assert_eq!(
-            marker,
-            "cuda_oxide_ptx_merge_required_246e25db_nested__map_value"
-        );
-        assert!(is_ptx_merge_required_marker(&marker));
-        assert!(is_ptx_merge_required_marker(&format!(
-            "crate::module::{marker}"
-        )));
-        assert!(!is_ptx_merge_required_marker(PTX_MERGE_REQUIRED_PREFIX));
-        assert!(!is_ptx_merge_required_marker(&format!("prefix_{marker}")));
-        assert!(!is_ptx_merge_required_marker(&format!("{marker}::child")));
     }
 
     #[test]

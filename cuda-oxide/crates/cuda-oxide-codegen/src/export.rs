@@ -242,6 +242,7 @@ pub fn export_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug: DebugExport,
+    weak_odr_functions: bool,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let exported = render_exported_llvm_ir(
         ctx,
@@ -250,6 +251,7 @@ pub fn export_llvm_ir(
         emit_nvvm_ir,
         nvvm_dialect,
         debug,
+        weak_odr_functions,
     )?;
 
     std::fs::write(path, &exported.llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
@@ -279,6 +281,7 @@ pub fn render_llvm_ir(
         emit_nvvm_ir,
         nvvm_dialect,
         debug,
+        false,
     )
     .map(|exported| exported.llvm_ir)
 }
@@ -290,6 +293,7 @@ fn render_exported_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug: DebugExport,
+    weak_odr_functions: bool,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
@@ -299,7 +303,8 @@ fn render_exported_llvm_ir(
             PipelineError::Export("NVVM export reached without a selected IR dialect".to_string())
         })?;
         let config = PipelineExportConfig {
-            inner: llvm_export::export::NvvmExportConfig::new(dialect),
+            inner: llvm_export::export::NvvmExportConfig::new(dialect)
+                .with_weak_odr_functions(weak_odr_functions),
             debug,
         };
         llvm_export::export::export_module_with_externs_and_roots(
@@ -354,6 +359,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
         self.inner.emit_ptx_kernel_keyword()
+    }
+
+    fn weak_odr_functions(&self) -> bool {
+        self.inner.weak_odr_functions()
     }
 
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {

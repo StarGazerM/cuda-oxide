@@ -439,6 +439,53 @@ entry:
         }
     }
 
+    #[test]
+    #[ignore = "requires discoverable CUDA Toolkit libNVVM, nvJitLink, and libdevice"]
+    fn live_cross_crate_link_coalesces_weak_definitions_and_keeps_all_entries() {
+        fn module(entry: &str) -> String {
+            format!(r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+@llvm.used = appending global [2 x i8*] [i8* bitcast (void (i32*)* @{entry} to i8*), i8* bitcast (void ()* @shared_kernel to i8*)], section "llvm.metadata"
+define weak_odr i32 @shared_helper() noinline {{
+  ret i32 42
+}}
+define weak_odr void @shared_kernel() {{
+  ret void
+}}
+define weak_odr void @{entry}(i32* %out) {{
+  %value = call i32 @shared_helper()
+  store i32 %value, i32* %out
+  ret void
+}}
+!nvvm.annotations = !{{!0, !1}}
+!nvvmir.version = !{{!2}}
+!0 = !{{void (i32*)* @{entry}, !"kernel", i32 1}}
+!1 = !{{void ()* @shared_kernel, !"kernel", i32 1}}
+!2 = !{{i32 2, i32 0, i32 3, i32 1}}
+"#)
+        }
+
+        let finalizer = Finalizer::discover().unwrap();
+        let options = FinalizationOptions::new("sm_86".parse().unwrap());
+        let dependency = finalizer.compiler().compile_nvvm_ir_to_ltoir(
+            "dependency.ll", module("generic_u32").as_bytes(), &options,
+        ).unwrap();
+        let consumer = finalizer.compiler().compile_nvvm_ir_to_ltoir(
+            "consumer.ll", module("generic_u64").as_bytes(), &options,
+        ).unwrap();
+        let cubin = finalizer.link_ltoir(
+            &[NamedInput::new("dependency.ltoir", &dependency), NamedInput::new("consumer.ltoir", &consumer)],
+            &options,
+            FinalizerOutput::Cubin,
+        ).unwrap();
+        assert!(is_valid_cubin(&cubin));
+        for symbol in ["generic_u32", "generic_u64", "shared_kernel"] {
+            assert!(cubin.windows(symbol.len()).any(|part| part == symbol.as_bytes()),
+                "linked cubin is missing {symbol}");
+        }
+    }
+
     /// Legacy-dialect NVVM IR for a kernel that ptxas must spill: `values`
     /// floats stay live across `rounds` of all-to-all mixing while a
     /// `maxnreg` annotation caps the kernel far below that live set.

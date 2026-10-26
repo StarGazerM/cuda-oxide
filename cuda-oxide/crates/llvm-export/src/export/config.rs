@@ -141,6 +141,11 @@ pub trait ExportBackendConfig {
         None
     }
 
+    /// Coalesce equivalent cross-crate definitions during ahead-of-time device linking.
+    fn weak_odr_functions(&self) -> bool {
+        false
+    }
+
     /// Which device debug metadata tier to emit.
     fn debug_kind(&self) -> DebugKind {
         DebugKind::Off
@@ -206,15 +211,25 @@ impl ExportBackendConfig for PtxExportConfig {
 #[derive(Clone, Debug, Default)]
 pub struct NvvmExportConfig {
     dialect: NvvmIrDialect,
+    weak_odr_functions: bool,
 }
 
 impl NvvmExportConfig {
     pub fn new(dialect: NvvmIrDialect) -> Self {
-        Self { dialect }
+        Self {
+            dialect,
+            weak_odr_functions: false,
+        }
     }
 
     pub fn dialect(&self) -> NvvmIrDialect {
         self.dialect
+    }
+
+    /// Mark definitions emitted into multiple crate artifacts as ODR-equivalent.
+    pub fn with_weak_odr_functions(mut self, enabled: bool) -> Self {
+        self.weak_odr_functions = enabled;
+        self
     }
 }
 
@@ -251,6 +266,10 @@ impl ExportBackendConfig for NvvmExportConfig {
 
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {
         Some(self.dialect)
+    }
+
+    fn weak_odr_functions(&self) -> bool {
+        self.weak_odr_functions
     }
 }
 

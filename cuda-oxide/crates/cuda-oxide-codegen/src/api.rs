@@ -679,6 +679,7 @@ impl Compiler {
             opt_override: None,
             mir_pass_pipeline: options.mir_pass_pipeline.clone(),
             module_disambiguator: None,
+            aot_device_link: false,
         };
         let request = ModulePipelineRequest::for_standalone_ptx(
             &backend_options,

@@ -332,6 +332,7 @@ extern crate rustc_codegen_llvm;
 mod collector;
 mod device_codegen;
 mod generated_intrinsics;
+mod aot_link;
 mod materialize;
 
 use rustc_codegen_ssa::traits::CodegenBackend;
@@ -743,7 +744,6 @@ impl CodegenBackend for CudaCodegenBackend {
                 materialize::validate_collection(
                     materialization_request,
                     !collection_result.device_externs.is_empty(),
-                    collection_result.requires_ptx_bundle_merge,
                 )
                 .unwrap_or_else(|error| {
                     tcx.dcx().fatal(format!(
@@ -768,6 +768,7 @@ impl CodegenBackend for CudaCodegenBackend {
                 // Create device codegen config from our config
                 let device_config =
                     device_codegen::DeviceCodegenConfig {
+                        aot_device_link: materialization_request.is_some(),
                         output_dir: self.config.ptx_output_dir.clone().unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| ".".into())
                         }),
@@ -974,14 +975,69 @@ impl CodegenBackend for CudaCodegenBackend {
     fn link(
         &self,
         sess: &Session,
-        compiled_modules: CompiledModules,
+        mut compiled_modules: CompiledModules,
         crate_info: CrateInfo,
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
+        if needs_aot_device_link(&crate_info.crate_types) {
+            let linked = (|| -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+                let Some(request) = materialize::request_from_env()? else {
+                    return Ok(None);
+                };
+                let mut paths: Vec<_> = compiled_modules.modules.iter()
+                    .filter_map(|module| module.object.clone())
+                    .collect();
+                for cnum in &crate_info.used_crates {
+                    let source = &crate_info.used_crate_source[cnum];
+                    if let Some(path) = source.rlib.as_ref().or(source.dylib.as_ref()) {
+                        paths.push(path.clone());
+                    }
+                }
+                let bundles = aot_link::gather(paths)?;
+                let Some(blob) = aot_link::materialize(request, &bundles)? else {
+                    return Ok(None);
+                };
+                let host_target = sess.target.llvm_target.as_ref();
+                let object = oxide_artifacts::build_host_object_for_target(
+                    &blob, host_target, None,
+                )?;
+                let output_dir = self.config.ptx_output_dir.clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+                Ok(Some(write_artifact_object(
+                    &output_dir,
+                    crate_info.local_crate_name.as_str(),
+                    host_target,
+                    &object,
+                    "linked",
+                )?))
+            })();
+            match linked {
+                Ok(Some(object)) => compiled_modules.modules.push(CompiledModule {
+                    name: "oxide_artifact_linked".into(),
+                    kind: ModuleKind::Regular,
+                    object: Some(object),
+                    dwarf_object: None,
+                    bytecode: None,
+                    assembly: None,
+                    llvm_ir: None,
+                    global_asm_object: None,
+                    links_from_incr_cache: Vec::new(),
+                }),
+                Ok(None) => {}
+                Err(error) => sess.dcx().fatal(format!(
+                    "[rustc_codegen_cuda] Failed to link AOT device image: {error}"
+                )),
+            }
+        }
         self.llvm_backend
             .link(sess, compiled_modules, crate_info, metadata, outputs);
     }
+}
+
+fn needs_aot_device_link(crate_types: &[rustc_session::config::CrateType]) -> bool {
+    use rustc_session::config::CrateType;
+    crate_types.iter().any(|kind| !matches!(kind, CrateType::Rlib | CrateType::StaticLib))
 }
 
 /// Write `<output_name>.tileexports.json` next to the `.ll`/`.ptx`: the JSON
@@ -1021,6 +1077,7 @@ fn write_device_artifact_object(
         result,
         artifact,
     )?;
+    let link_input = materialized_artifact.as_ref().map(|_| artifact);
     if let Some(materialized) = materialized_artifact.as_ref() {
         emit_launch_bounds_spill_warnings(tcx, result, functions, &materialized.resource_usage);
     }
@@ -1061,6 +1118,24 @@ fn write_device_artifact_object(
             &artifact.name,
             &artifact.bytes,
         ));
+    // Keep compiler IR next to the anchored per-crate image. Final host
+    // linking gathers these inputs even from unextracted rlib members.
+    if let Some(input) = link_input {
+        let kind = match input.kind {
+            device_codegen::DeviceCodegenArtifactKind::NvvmIr => {
+                oxide_artifacts::ArtifactPayloadKind::NvvmIr
+            }
+            device_codegen::DeviceCodegenArtifactKind::Ltoir => {
+                oxide_artifacts::ArtifactPayloadKind::Ltoir
+            }
+            _ => unreachable!("materialization accepts only compiler IR"),
+        };
+        spec = spec.with_payload(oxide_artifacts::ArtifactPayloadSpec::new(
+            kind,
+            &input.name,
+            &input.bytes,
+        ));
+    }
     for function in functions {
         let kind = if function.is_kernel {
             oxide_artifacts::ArtifactEntryKind::Kernel
@@ -1364,6 +1439,17 @@ pub(crate) fn host_target_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aot_device_link_runs_only_for_final_host_images() {
+        use rustc_session::config::CrateType;
+        assert!(!needs_aot_device_link(&[]));
+        assert!(!needs_aot_device_link(&[CrateType::Rlib, CrateType::StaticLib]));
+        for kind in [CrateType::Executable, CrateType::Dylib, CrateType::Cdylib, CrateType::ProcMacro, CrateType::Sdylib] {
+            assert!(needs_aot_device_link(&[kind]));
+            assert!(needs_aot_device_link(&[CrateType::Rlib, kind]));
+        }
+    }
 
     #[test]
     fn host_targets_that_match_the_ptx_data_model_are_accepted() {

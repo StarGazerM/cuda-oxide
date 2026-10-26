@@ -642,6 +642,7 @@ pub fn compile_translated_module(
             kind: request.debug_kind,
             function_local_static_placement,
         },
+        request.backend.aot_device_link,
     )?;
     if request.trace.verbose {
         request.trace.emit(format!(

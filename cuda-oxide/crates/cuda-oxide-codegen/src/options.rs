@@ -112,6 +112,9 @@ pub struct BackendOptions {
     /// definition (#1277). The rustc pipeline passes the crate's
     /// `StableCrateId` hash; `None` keeps the undecorated historical names.
     pub module_disambiguator: Option<u64>,
+    /// Emit ODR-equivalent function definitions for build-time cross-crate linking.
+    /// The frontend enables this only for provenance-checked materialization.
+    pub aot_device_link: bool,
 }
 
 impl Default for BackendOptions {
@@ -128,6 +131,7 @@ impl Default for BackendOptions {
             opt_override: None,
             mir_pass_pipeline: None,
             module_disambiguator: None,
+            aot_device_link: false,
         }
     }
 }
@@ -174,6 +178,7 @@ impl BackendOptions {
             // Compilation identity, not an environment compatibility knob:
             // the pipeline host sets it from its own crate identity.
             module_disambiguator: None,
+            aot_device_link: false,
         }
     }
 }

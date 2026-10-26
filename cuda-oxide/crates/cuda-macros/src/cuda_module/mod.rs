@@ -36,9 +36,7 @@ use crate::launch_attrs::{add_launch_bounds_evaluatability_from_attrs, rewrite_l
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use reserved_oxide_symbols::{
-    DEVICE_CODEGEN_CRATE_ENV, artifact_anchor_symbol_v2, ptx_merge_required_marker,
-};
+use reserved_oxide_symbols::{DEVICE_CODEGEN_CRATE_ENV, artifact_anchor_symbol_v2};
 use syn::{
     Ident, Item, ItemFn, ItemMod, LitStr, Token, parse_macro_input, parse_quote,
     punctuated::Punctuated,
@@ -126,23 +124,6 @@ pub(crate) fn expand_cuda_module_inner(
 
     let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&transformed.kernels)?;
     let has_generic = transformed.kernels.iter().any(|k| k.is_generic);
-    let ptx_merge_required_markers = transformed.kernels.iter().filter_map(|kernel| {
-        if !kernel.is_generic {
-            return None;
-        }
-        let marker = internal_ident(&ptx_merge_required_marker(&kernel.fn_name.to_string()));
-        let cfg_attrs = &kernel.effective_cfg_attrs;
-        Some(quote! {
-            #(#cfg_attrs)*
-            // Consumed by the codegen collector. This enabled generic kernel
-            // requires run-time PTX bundle merging, which ahead-of-time cubin
-            // materialization cannot represent yet.
-            #[doc(hidden)]
-            #[used]
-            #[allow(dead_code, non_upper_case_globals)]
-            static #marker: u8 = 0;
-        })
-    });
     let enable_generic_loader_statements = transformed.kernels.iter().filter_map(|kernel| {
         if !kernel.is_generic {
             return None;
@@ -181,9 +162,8 @@ pub(crate) fn expand_cuda_module_inner(
         }
     };
     let module_loader = if has_generic {
-        // A syntactically present generic kernel may be removed by cfg. Make
-        // the loader decision under the exact same effective cfg chain as its
-        // marker, so eligibility and run-time behavior cannot disagree.
+        // A syntactically present generic kernel may be removed by cfg. Select
+        // the cross-crate loader only under the kernel's effective cfg chain.
         quote! {
             #[allow(unused_mut)]
             let mut __cuda_oxide_has_enabled_generic_kernel = false;
@@ -231,8 +211,8 @@ pub(crate) fn expand_cuda_module_inner(
             /// For a non-generic module, the selected package bundle must be
             /// the artifact compiled from this `cuda_module`; package names are
             /// not yet unique across all library and binary targets. For a
-            /// generic module, the merged PTX set must contain each matching
-            /// specialization and no conflicting entry definition.
+            /// generic module, the linked cubin or merged PTX set must contain
+            /// each matching specialization and no conflicting entry definition.
             pub unsafe fn load_async(
                 device_id: usize,
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::cuda_async::simt::error::DeviceError> {
@@ -436,7 +416,6 @@ pub(crate) fn expand_cuda_module_inner(
         #(#module_attrs)*
         #vis mod #ident {
             #(#module_items)*
-            #(#ptx_merge_required_markers)*
             #host_items
         }
     })

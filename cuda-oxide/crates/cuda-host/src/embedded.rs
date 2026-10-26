@@ -121,29 +121,22 @@ fn artifact_bundles_containing(
     }
 }
 
-/// Merge all PTX bundles from the current executable into a single CUDA module.
+/// Load the cross-crate kernel set, preferring its ahead-of-time linked cubin.
 ///
-/// When a generic kernel is monomorphized in a consuming crate, its PTX ends
-/// up in that crate's bundle rather than the defining crate's bundle. This
-/// function gathers every PTX bundle in the binary, strips duplicate header
-/// directives (`.version`, `.target`, `.address_size`) from all but the first
-/// bundle, concatenates the bodies, and loads the result as one CUDA module.
-/// All kernel symbols are therefore available regardless of which crate bundle
-/// they were compiled into.
+/// With build-time cubin materialization, the backend links all local and
+/// dependency device artifacts into one native cubin at the final host link.
+/// Generic kernel specializations are therefore available even when emitted in
+/// a consuming crate. Loading this image does not invoke the driver PTX JIT.
 ///
-/// A cross-crate device function reached by kernels in several crates is
-/// emitted into each of their bundles. Later copies whose code matches the
-/// first definition are dropped; a same-named definition with different code
-/// is reported as invalid PTX instead of being resolved arbitrarily.
-///
-/// Bundles with non-PTX payloads (NVVM IR, LTOIR, cubin) are skipped; use
-/// `load_embedded_module` for those.
+/// Without materialization, this merges every PTX bundle in the executable:
+/// repeated headers and identical device-function definitions are removed;
+/// conflicting same-named definitions are rejected. Other payloads are skipped.
+/// The historical function name describes this non-materialized path.
 pub fn load_all_ptx_bundles_merged(
     ctx: &Arc<CudaContext>,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
-    // The embedded bundles are immutable for the life of the process, so the
-    // merged module for a context is built once and shared; repeated loads
-    // (one per runtime program instance) must not re-parse and re-JIT it.
+    // Embedded bundles are immutable for the life of the process. Share the
+    // linked or merged module per context instead of loading it per program.
     thread_local! {
         static MERGED: std::cell::RefCell<Vec<(usize, Arc<CudaModule>)>> =
             const { std::cell::RefCell::new(Vec::new()) };
@@ -163,6 +156,9 @@ fn load_all_ptx_bundles_merged_uncached(
     ctx: &Arc<CudaContext>,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
     let bundles = artifact_bundles_from_current_exe()?;
+    if let Some(cubin) = linked_cubin(&bundles)? {
+        return Ok(ctx.load_module_from_image(cubin)?);
+    }
     let merged = merge_ptx_bundles(&bundles)?;
 
     let module = ctx.load_module_from_image(merged.as_bytes())?;
@@ -173,6 +169,21 @@ fn load_all_ptx_bundles_merged_uncached(
     // opaque "named symbol not found". See `crate::entry_registry`.
     crate::entry_registry::register_merged_module_entries(&module, &merged);
     Ok(module)
+}
+
+fn linked_cubin(bundles: &[OwnedArtifactBundle]) -> Result<Option<&[u8]>, EmbeddedModuleError> {
+    let Some(bundle) = bundles
+        .iter()
+        .find(|bundle| bundle.name == reserved_oxide_symbols::LINKED_CUBIN_BUNDLE_NAME)
+    else {
+        return Ok(None);
+    };
+    bundle
+        .payload(ArtifactPayloadKind::Cubin)
+        .map(Some)
+        .ok_or_else(|| EmbeddedModuleError::UnsupportedPayload {
+            name: bundle.name.clone(),
+        })
 }
 
 /// Merge the PTX payloads of `bundles`, in iteration order, into one PTX
@@ -645,6 +656,34 @@ mod tests {
             }],
             entries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn linked_cubin_wins_over_ptx_without_runtime_compilation() {
+        use oxide_artifacts::OwnedArtifactPayload;
+        let ptx = ptx_bundle("ordinary", "not valid PTX");
+        let mut linked = bundle_with_target("sm_89");
+        linked.name = reserved_oxide_symbols::LINKED_CUBIN_BUNDLE_NAME.to_string();
+        linked.payloads.push(OwnedArtifactPayload {
+            kind: ArtifactPayloadKind::Cubin,
+            name: "linked.cubin".to_string(),
+            bytes: b"\x7fELF".to_vec(),
+        });
+        assert_eq!(
+            linked_cubin(&[ptx, linked]).unwrap(),
+            Some(b"\x7fELF".as_slice())
+        );
+    }
+
+    #[test]
+    fn malformed_linked_bundle_never_falls_back_to_ptx() {
+        let ptx = ptx_bundle("ordinary", ".version 8.9\n");
+        assert!(linked_cubin(std::slice::from_ref(&ptx)).unwrap().is_none());
+        let malformed = ptx_bundle(reserved_oxide_symbols::LINKED_CUBIN_BUNDLE_NAME, ".version 8.9\n");
+        assert!(matches!(
+            linked_cubin(&[ptx, malformed]),
+            Err(EmbeddedModuleError::UnsupportedPayload { .. })
+        ));
     }
 
     /// The merge is order-explicit: exactly one header set (the first PTX

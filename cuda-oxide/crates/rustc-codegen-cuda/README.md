@@ -140,6 +140,32 @@ underscores. Host LLVM codegen still runs for every crate. An excluded target
 must not call its generated module loader; the filter suppresses its device
 artifact but does not give sibling targets separate runtime bundle names.
 
+### Ahead-of-time cubins
+
+`cargo oxide build --materialize-cubin --arch sm_XX` finalizes device code
+with the wrapper's provenance-checked libNVVM and nvJitLink tools. Each
+device crate embeds an anchored native cubin plus its linkable compiler IR.
+Rlibs and static libraries retain those inputs without performing a final
+whole-program device link.
+
+When rustc links an executable or shared library, the backend gathers local
+objects and dependency rlib members (including members not selected by the
+host linker), compiles retained NVVM IR to LTOIR, and links all device modules
+with nvJitLink. Repeated cross-crate function definitions use weak-ODR
+linkage. The resulting cubin is embedded as the reserved
+`__cuda_oxide_linked` bundle with the union of device entry metadata.
+Generic module loading uses this final image, including specializations
+emitted by consumer crates, instead of merging PTX at runtime. Ordinary
+anchored module loading continues to use each crate's native cubin.
+
+All linked device bundles must carry compatible architecture and compile
+policies and retain NVVM IR or LTOIR. Rebuild every device dependency under
+the same materialization settings; PTX-only or cubin-only inputs fail closed.
+`#[device] extern` inputs remain unsupported because their external link
+inputs are not available to this backend. Materialization requires the
+`cargo oxide` provenance handshake and produces architecture-specific
+images; the default non-materialized compilation path is unchanged.
+
 ### Official CUTLASS backend
 
 The ordinary MIR/NVVM/LLVM backend remains the default. To compile high-level

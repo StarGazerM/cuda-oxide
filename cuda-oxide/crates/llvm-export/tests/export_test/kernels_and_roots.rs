@@ -62,6 +62,49 @@ fn legacy_kernel_metadata_uses_typed_function_references() {
 }
 
 #[test]
+fn aot_device_link_uses_weak_odr_definitions_but_not_declarations() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "aot_linkage".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let func_ty = FuncType::get(&ctx, VoidType::get(&ctx).into(), vec![], false);
+    for (name, kernel, definition) in [
+        ("entry_kernel", true, true),
+        ("shared_helper", false, true),
+        ("external_helper", false, false),
+    ] {
+        let func = FuncOp::new(&mut ctx, name.try_into().unwrap(), func_ty);
+        if kernel {
+            func.get_operation().deref_mut(&ctx).attributes.set(
+                "gpu_kernel".try_into().unwrap(),
+                StringAttr::new("true".into()),
+            );
+        }
+        if definition {
+            let entry = func.get_or_create_entry_block(&mut ctx);
+            ReturnOp::new(&mut ctx, None)
+                .get_operation()
+                .insert_at_back(entry, &ctx);
+        }
+        func.get_operation().insert_at_back(module_block, &ctx);
+    }
+
+    for dialect in [NvvmIrDialect::LegacyLlvm7, NvvmIrDialect::Modern] {
+        for enabled in [false, true] {
+            let config = NvvmExportConfig::new(dialect).with_weak_odr_functions(enabled);
+            let ir = export_module_to_string_with_config(&ctx, &module, &config).unwrap();
+            let linkage = if enabled { "weak_odr " } else { "" };
+            assert!(ir.contains(&format!("define {linkage}void @entry_kernel(")), "{ir}");
+            assert!(ir.contains(&format!("define {linkage}void @shared_helper(")), "{ir}");
+            assert!(ir.contains("declare void @external_helper("), "{ir}");
+            assert!(!ir.contains("declare weak_odr"), "{ir}");
+            assert_eq!(ir.matches("weak_odr").count(), if enabled { 2 } else { 0 });
+        }
+    }
+    let ptx_ir = export_module_to_string_with_config(&ctx, &module, &PtxExportConfig).unwrap();
+    assert!(!ptx_ir.contains("weak_odr"), "{ptx_ir}");
+}
+
+#[test]
 fn llvm_used_roots_only_explicitly_retained_globals() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "retained_globals".try_into().unwrap());

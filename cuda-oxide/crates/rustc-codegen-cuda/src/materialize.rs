@@ -92,11 +92,6 @@ pub(crate) enum MaterializeError {
     ProvenanceMismatch { expected: String, actual: String },
 
     #[error(
-        "build-time cubin materialization does not yet support generic #[cuda_module] loading because it merges PTX bundles across crates at run time"
-    )]
-    RequiresPtxBundleMerge,
-
-    #[error(
         "build-time cubin materialization does not yet support #[device] extern declarations because their ordered external link inputs are not available to the backend"
     )]
     HasDeviceExterns,
@@ -176,13 +171,9 @@ fn validate_tool_identity_handshake(
 pub(crate) fn validate_collection(
     request: Option<MaterializationRequest>,
     has_device_externs: bool,
-    requires_ptx_bundle_merge: bool,
 ) -> Result<(), MaterializeError> {
     if request.is_none() {
         return Ok(());
-    }
-    if requires_ptx_bundle_merge {
-        return Err(MaterializeError::RequiresPtxBundleMerge);
     }
     if has_device_externs {
         return Err(MaterializeError::HasDeviceExterns);
@@ -239,7 +230,7 @@ fn options(
         .with_debug_policy(debug_policy))
 }
 
-fn checked_finalizer(request: MaterializationRequest) -> Result<Finalizer, MaterializeError> {
+pub(crate) fn checked_finalizer(request: MaterializationRequest) -> Result<Finalizer, MaterializeError> {
     let finalizer = Finalizer::discover_with_handshake(&request.tool_identity_handshake)?;
     let actual = finalizer
         .provenance_digest()
@@ -391,15 +382,12 @@ mod tests {
             expected_provenance: handshake.provenance_sha256,
             tool_identity_handshake: handshake,
         });
+        assert!(validate_collection(request, false).is_ok());
         assert!(matches!(
-            validate_collection(request, false, true),
-            Err(MaterializeError::RequiresPtxBundleMerge)
-        ));
-        assert!(matches!(
-            validate_collection(request, true, false),
+            validate_collection(request, true),
             Err(MaterializeError::HasDeviceExterns)
         ));
-        assert!(validate_collection(None, true, true).is_ok());
+        assert!(validate_collection(None, true).is_ok());
     }
 
     #[test]

@@ -389,7 +389,7 @@ use oxide_tile_export::TileExportDesc;
 use reserved_oxide_symbols::{
     device_base_name, device_extern_base_name, is_current_device_symbol, is_current_kernel_symbol,
     is_device_extern_symbol, is_device_symbol, is_kernel_symbol, is_legacy_kernel_symbol,
-    is_ptx_merge_required_marker, is_tile_export_meta_symbol, kernel_base_name,
+    is_tile_export_meta_symbol, kernel_base_name,
 };
 
 /// Sanitize a symbol name for use as a PTX identifier.
@@ -528,14 +528,6 @@ pub struct CollectionResult<'tcx> {
 
     /// External device function declarations (no MIR, emit as `declare`).
     pub device_externs: Vec<DeviceExternDecl>,
-
-    /// Whether this crate needs the run-time loader to merge PTX bundles.
-    ///
-    /// This is true for a `#[cuda_module]` containing a generic kernel and
-    /// for a concrete specialization of a generic kernel imported from a
-    /// dependency. Cubin materialization must reject this case until it can
-    /// reproduce the same cross-crate linking semantics.
-    pub requires_ptx_bundle_merge: bool,
 
     /// `#[tile_export]` descriptions read from this crate's metadata
     /// functions, sorted by implementation symbol. Each one's implementation
@@ -1227,12 +1219,6 @@ pub fn collect_device_functions<'tcx>(
 ) -> CollectionResult<'tcx> {
     let mut collector = DeviceCollector::new(tcx, verbose);
     let tile_exports = collect_tile_exports(tcx, cgus, verbose);
-    let mut requires_ptx_bundle_merge = cgus.iter().any(|cgu| {
-        cgu.items().iter().any(|(item, _data)| match item {
-            MonoItem::Static(def_id) => is_ptx_merge_required_marker(&tcx.def_path_str(*def_id)),
-            _ => false,
-        })
-    });
 
     // Find all kernel entry points. `#[tile_export]` metadata functions are
     // host-only (their descriptions were read above) and never device code;
@@ -1257,15 +1243,6 @@ pub fn collect_device_functions<'tcx>(
                     }
                     continue;
                 }
-
-                // A downstream monomorphization of a generic kernel may be
-                // present even when the defining crate's private module
-                // marker is not. Such modules use the all-PTX-bundles loader,
-                // so strict ahead-of-time cubin materialization cannot safely
-                // compile only this crate's artifact.
-                requires_ptx_bundle_merge |= tcx
-                    .generics_of(instance.def_id())
-                    .requires_monomorphization(tcx);
 
                 let name = tcx.def_path_str(instance.def_id());
                 // Extract the kernel base name by stripping the reserved
@@ -1385,7 +1362,6 @@ pub fn collect_device_functions<'tcx>(
 
     // Process the worklist to collect all reachable functions
     let mut result = collector.collect();
-    result.requires_ptx_bundle_merge = requires_ptx_bundle_merge;
     result.tile_exports = tile_exports;
     result
 }
@@ -1600,7 +1576,6 @@ impl<'tcx> DeviceCollector<'tcx> {
         CollectionResult {
             functions: self.result,
             device_externs: self.device_externs,
-            requires_ptx_bundle_merge: false,
             tile_exports: Vec::new(),
         }
     }
@@ -3208,7 +3183,6 @@ mod tests {
     };
     use reserved_oxide_symbols::{
         DEVICE_PREFIX, KERNEL_PREFIX, LEGACY_DEVICE_PREFIX, LEGACY_KERNEL_PREFIX,
-        PTX_MERGE_REQUIRED_PREFIX, is_ptx_merge_required_marker, ptx_merge_required_marker,
     };
     use rustc_middle::mir::BasicBlock;
 
@@ -3273,20 +3247,6 @@ mod tests {
         assert!(is_spin_loop_expansion("::core_arch::x86::sse2::_mm_pause"));
         assert!(!is_spin_loop_expansion("::core_arch::x86::rdtsc::rdtsc"));
         assert!(!is_spin_loop_expansion("::hint::spin_loop"));
-    }
-
-    #[test]
-    fn ptx_merge_marker_matches_only_the_final_path_component() {
-        let marker = ptx_merge_required_marker("map");
-        assert!(is_ptx_merge_required_marker(&marker));
-        assert!(is_ptx_merge_required_marker(&format!(
-            "crate_name::kernels::{marker}"
-        )));
-        assert!(!is_ptx_merge_required_marker(&format!(
-            "crate_name::prefix_{marker}"
-        )));
-        assert!(!is_ptx_merge_required_marker(PTX_MERGE_REQUIRED_PREFIX));
-        assert!(!is_ptx_merge_required_marker("crate_name::ordinary_static"));
     }
 
     #[test]
