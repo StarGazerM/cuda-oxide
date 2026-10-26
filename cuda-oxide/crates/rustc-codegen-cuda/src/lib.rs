@@ -767,13 +767,28 @@ impl CodegenBackend for CudaCodegenBackend {
                 // Extract references for the pipeline
                 let device_functions = &collection_result.functions;
 
+                // Device files go to a unit-private directory (see
+                // `unit_output_dir`); names, payload names and symbol
+                // identities stay derived from the crate name.
+                let artifact_root = self.config.ptx_output_dir.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| ".".into())
+                });
+                let unit_dir = unit_output_dir(
+                    &artifact_root,
+                    crate_name.as_str(),
+                    &tcx.sess.opts.cg.extra_filename,
+                )
+                .unwrap_or_else(|error| {
+                    tcx.dcx().fatal(format!(
+                        "[rustc_codegen_cuda] Failed to create unit artifact directory: {error}"
+                    ))
+                });
+
                 // Create device codegen config from our config
                 let device_config =
                     device_codegen::DeviceCodegenConfig {
                         aot_device_link: materialization_request.is_some(),
-                        output_dir: self.config.ptx_output_dir.clone().unwrap_or_else(|| {
-                            std::env::current_dir().unwrap_or_else(|_| ".".into())
-                        }),
+                        output_dir: unit_dir,
                         output_name: tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string(),
                         mlir_output: self.config.mlir_output.clone(),
                         device_backend: device_backend.clone(),
@@ -909,6 +924,15 @@ impl CodegenBackend for CudaCodegenBackend {
                                     "[rustc_codegen_cuda] Failed to write tile export descriptions: {e}"
                                 )),
                             }
+                        }
+                        if let Err(e) = publish_canonical_artifacts(
+                            &device_config.output_dir,
+                            &artifact_root,
+                            &device_config.output_name,
+                        ) {
+                            tcx.dcx().fatal(format!(
+                                "[rustc_codegen_cuda] Failed to publish device artifacts: {e}"
+                            ));
                         }
                         Some(result)
                     }
@@ -1048,6 +1072,69 @@ impl CodegenBackend for CudaCodegenBackend {
 fn needs_aot_device_link(crate_types: &[rustc_session::config::CrateType]) -> bool {
     use rustc_session::config::CrateType;
     crate_types.iter().any(|kind| !matches!(kind, CrateType::Rlib | CrateType::StaticLib))
+}
+
+/// Give each rustc unit a private device-artifact directory.
+///
+/// Cargo compiles a binary and its test harness (and other same-named units)
+/// concurrently with one `CUDA_OXIDE_PTX_DIR`; each unit gets a distinct
+/// `-C extra-filename`. Sharing `<crate>.{ll,ptx,...}` let one unit's
+/// stale-file cleanup and rewrite race the other's read-back (a missing `.ptx`
+/// during verification, or a truncated payload embedded as an invalid kernel
+/// image). Only the directory differs: file names, payload names and symbol
+/// identities still derive from the crate name. Without Cargo the suffix is
+/// empty and the shared directory is used unchanged.
+fn unit_output_dir(root: &Path, crate_name: &str, extra_filename: &str) -> std::io::Result<PathBuf> {
+    if extra_filename.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let directory = root
+        .join(".units")
+        .join(sanitize_path_component(&format!("{crate_name}{extra_filename}")));
+    std::fs::create_dir_all(&directory)?;
+    Ok(directory)
+}
+
+/// Expose a unit's outputs under the conventional `<root>/<crate>.<suffix>`
+/// paths read by `cargo oxide` tooling. Each file is staged under a private
+/// name and renamed into place, so concurrent units publish complete files; a
+/// conventional file this unit did not produce is removed, matching the
+/// pipeline's own stale-artifact cleanup.
+fn publish_canonical_artifacts(unit_dir: &Path, root: &Path, crate_name: &str) -> std::io::Result<()> {
+    if unit_dir == root {
+        return Ok(());
+    }
+    let suffixes = [
+        "ll",
+        "opt.ll",
+        "linked.ll",
+        "linked.opt.ll",
+        "ptx",
+        "target",
+        "options",
+        "ltoir",
+        "cubin",
+        "cubin.target",
+        oxide_tile_export::DESCRIPTIONS_SUFFIX,
+    ];
+    for suffix in suffixes {
+        let source = unit_dir.join(format!("{crate_name}.{suffix}"));
+        let canonical = root.join(format!("{crate_name}.{suffix}"));
+        if source.is_file() {
+            let staging = root.join(format!(
+                "{crate_name}.{suffix}.{}.{}.publish",
+                std::process::id(),
+                ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::copy(&source, &staging)?;
+            std::fs::rename(&staging, &canonical)?;
+        } else if let Err(error) = std::fs::remove_file(&canonical)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Write `<output_name>.tileexports.json` next to the `.ll`/`.ptx`: the JSON
@@ -1452,6 +1539,37 @@ pub(crate) fn host_target_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_crate_units_write_private_artifacts_and_publish_complete_canonical_files() {
+        let root = std::env::temp_dir().join(format!(
+            "oxide-unit-publish-{}-{}",
+            std::process::id(),
+            ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = unit_output_dir(&root, "triangle", "-1111").unwrap();
+        let test = unit_output_dir(&root, "triangle", "-2222").unwrap();
+        assert_ne!(bin, test);
+        assert_eq!(unit_output_dir(&root, "triangle", "").unwrap(), root);
+        std::fs::write(bin.join("triangle.ptx"), "bin").unwrap();
+        std::fs::write(test.join("triangle.ptx"), "test").unwrap();
+        std::fs::write(root.join("triangle.cubin"), "stale").unwrap();
+        publish_canonical_artifacts(&bin, &root, "triangle").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("triangle.ptx")).unwrap(), "bin");
+        assert!(!root.join("triangle.cubin").exists(), "stale canonical output removed");
+        publish_canonical_artifacts(&test, &root, "triangle").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("triangle.ptx")).unwrap(), "test");
+        // Each unit's private file is untouched by the other's publication.
+        assert_eq!(std::fs::read_to_string(bin.join("triangle.ptx")).unwrap(), "bin");
+        assert!(
+            std::fs::read_dir(&root).unwrap().all(|entry| {
+                !entry.unwrap().file_name().to_string_lossy().ends_with(".publish")
+            }),
+            "no staging files remain"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn aot_device_link_runs_only_for_final_host_images() {
