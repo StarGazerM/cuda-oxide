@@ -105,18 +105,21 @@ explicit flag outranks that variable. Omitting the flags exports nothing rather 
 stages are asked to do, it participates in the codegen fingerprint: switching it
 rebuilds device code instead of reusing artifacts compiled under a different policy.
 
-`--materialize-cubin` moves the remaining libNVVM and nvJitLink work into the
-host build. The executable embeds a native cubin, so deployment does not need
-libNVVM, nvJitLink, or a first-load compilation step. This trades portability
-for startup simplicity: the cubin is pinned to the requested architecture and
-cannot use cuda-oxide's load-time PTX bridge on a newer GPU.
+`--materialize-cubin` finalizes the ordinary codegen output during the host build;
+it changes packaging, not the PTX optimizer. PTX is assembled with `ptxas`, while
+codegen paths that require NVVM IR or LTOIR keep their existing finalization route.
+Both preserve the requested FMA and debug policy, including `--no-fmad`.
+The executable embeds a native cubin, so deployment does not need compiler tools
+or a first-load compilation step. This trades portability for startup simplicity:
+the cubin is pinned to the requested architecture and cannot use cuda-oxide's
+load-time PTX bridge on a newer GPU.
 
 ```bash
 cargo oxide build vecadd --materialize-cubin --arch sm_120
 ```
 
-A concrete architecture and a build-host CUDA Toolkit (libNVVM, nvJitLink, and
-libdevice) are required. cargo-oxide fingerprints the exact compiler inputs and
+A concrete architecture and a build-host CUDA Toolkit (`ptxas`, libNVVM,
+nvJitLink, and libdevice) are required. cargo-oxide fingerprints the exact compiler inputs and
 rechecks them inside the backend; use the wrapper flag instead of setting
 `CUDA_OXIDE_MATERIALIZE_CUBIN` around raw Cargo. That variable is an internal
 wrapper/backend signal, not a supported user interface: raw Cargo may reuse a

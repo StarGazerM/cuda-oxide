@@ -91,7 +91,7 @@ pub(super) fn passthrough_codegen_fingerprint_with_env(
     if let Some(level) = opts.device_debug.env_value() {
         effective_env.insert("CUDA_OXIDE_DEBUG".to_string(), level.as_bytes().to_vec());
     }
-    if opts.emit_nvvm_ir || materialization.enabled() {
+    if opts.emit_nvvm_ir {
         effective_env.insert("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), b"1".to_vec());
     }
     if let Some(prepared) = &materialization.prepared {

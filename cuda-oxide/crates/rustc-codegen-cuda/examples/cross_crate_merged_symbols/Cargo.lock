@@ -103,6 +103,7 @@ dependencies = [
 name = "cross_crate_merged_symbols"
 version = "0.1.0"
 dependencies = [
+ "cuda-artifact-finalizer",
  "cuda-core",
  "cuda-device",
  "cuda-host",
@@ -131,6 +132,8 @@ version = "0.2.1"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
+ "oxide-artifacts",
+ "ptx-parse",
  "serde",
  "sha2",
  "thiserror",
@@ -187,6 +190,7 @@ dependencies = [
  "libc",
  "oxide-artifacts",
  "ptx-parse",
+ "reserved-oxide-symbols",
  "sha2",
  "thiserror",
 ]

@@ -6,7 +6,7 @@
 //! Strict, opt-in build-time finalization of embedded device artifacts.
 //!
 //! `cargo oxide --materialize-cubin` discovers and fingerprints the exact
-//! libNVVM, nvJitLink, and libdevice inputs before invoking Cargo. Device
+//! libNVVM, nvJitLink, libdevice, and ptxas inputs before invoking Cargo. Device
 //! macros record the complete codegen identity and exact provenance as Cargo
 //! environment dependencies. We reopen the tools, bind the parent digest to
 //! matching retained-file identities, and revalidate those identities around
@@ -16,7 +16,7 @@
 
 use cuda_artifact_finalizer::{
     CudaArch, CudaArchParseError, DebugPolicy, FinalizationOptions, Finalizer, FinalizerError,
-    FinalizerOutput, KernelResourceUsage, NamedInput,
+    FinalizerOutput, KernelResourceUsage, NamedInput, PtxAssembler,
 };
 use thiserror::Error;
 
@@ -29,7 +29,6 @@ pub(crate) const CODEGEN_FINGERPRINT_ENV: &str = reserved_oxide_symbols::CODEGEN
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MaterializationRequest {
-    expected_provenance: [u8; 32],
     tool_identity_handshake: cuda_artifact_finalizer::MaterializerHandshakeV1,
 }
 
@@ -96,13 +95,11 @@ pub(crate) enum MaterializeError {
     )]
     HasDeviceExterns,
 
-    #[error(
-        "build-time cubin materialization requires an NVVM IR or LTOIR artifact, but codegen produced PTX; use cargo-oxide so materialization can force NVVM IR emission"
-    )]
-    PtxInput,
+    #[error("PTX cubin materialization requires cargo-oxide's ptxas provenance handshake")]
+    MissingPtxasProvenance,
 
     #[error(
-        "build-time cubin materialization expected compiler IR, but codegen already produced a cubin; refusing to bypass the provenance-checked finalization recipe"
+        "build-time cubin materialization expected PTX or compiler IR, but codegen already produced a cubin; refusing to bypass the provenance-checked finalization recipe"
     )]
     CubinInput,
 
@@ -143,7 +140,6 @@ pub(crate) fn request_from_env() -> Result<Option<MaterializationRequest>, Mater
     validate_tool_identity_handshake(expected_provenance, &handshake)?;
     validate_codegen_fingerprint()?;
     Ok(Some(MaterializationRequest {
-        expected_provenance,
         tool_identity_handshake: handshake,
     }))
 }
@@ -179,6 +175,24 @@ pub(crate) fn validate_collection(
         return Err(MaterializeError::HasDeviceExterns);
     }
     Ok(())
+}
+
+pub(crate) fn ptx_to_cubin(
+    request: MaterializationRequest,
+    ptx: &[u8],
+    module_name: &str,
+    target: &str,
+    allow_fma_contraction: bool,
+    debug_policy: DebugPolicy,
+) -> Result<MaterializedCubin, MaterializeError> {
+    let options = options(target, allow_fma_contraction, debug_policy)?;
+    let assembler = checked_ptx_assembler(request)?;
+    // nvJitLink's -fma does not control PTX contraction; ptxas --fmad does.
+    let report = assembler.assemble_ptx_with_report(NamedInput::new(module_name, ptx), &options)?;
+    Ok(MaterializedCubin {
+        bytes: report.image,
+        resource_usage: report.resource_usage,
+    })
 }
 
 pub(crate) fn nvvm_ir_to_cubin(
@@ -235,13 +249,34 @@ pub(crate) fn checked_finalizer(request: MaterializationRequest) -> Result<Final
     let actual = finalizer
         .provenance_digest()
         .ok_or(MaterializeError::UnverifiableProvenance)?;
-    if actual != request.expected_provenance {
+    let expected = request.tool_identity_handshake.ir_provenance_digest();
+    if actual != expected {
         return Err(MaterializeError::ProvenanceMismatch {
-            expected: digest_hex(&request.expected_provenance),
+            expected: digest_hex(&expected),
             actual: digest_hex(&actual),
         });
     }
     Ok(finalizer)
+}
+
+pub(crate) fn checked_ptx_assembler(
+    request: MaterializationRequest,
+) -> Result<PtxAssembler, MaterializeError> {
+    let expected = request
+        .tool_identity_handshake
+        .ptxas_sha256
+        .ok_or(MaterializeError::MissingPtxasProvenance)?;
+    let assembler = PtxAssembler::discover()?;
+    let actual = assembler
+        .ptxas_digest()
+        .ok_or(MaterializeError::UnverifiableProvenance)?;
+    if actual != expected {
+        return Err(MaterializeError::ProvenanceMismatch {
+            expected: digest_hex(&expected),
+            actual: digest_hex(&actual),
+        });
+    }
+    Ok(assembler)
 }
 
 fn parse_bool(value: &str) -> Result<bool, MaterializeError> {
@@ -379,7 +414,6 @@ mod tests {
     fn unsupported_collection_models_fail_without_tools() {
         let handshake = test_handshake();
         let request = Some(MaterializationRequest {
-            expected_provenance: handshake.provenance_sha256,
             tool_identity_handshake: handshake,
         });
         assert!(validate_collection(request, false).is_ok());
@@ -388,6 +422,51 @@ mod tests {
             Err(MaterializeError::HasDeviceExterns)
         ));
         assert!(validate_collection(None, true).is_ok());
+    }
+
+    #[test]
+    fn ptx_materialization_requires_assembler_provenance_before_discovery() {
+        let request = MaterializationRequest {
+            tool_identity_handshake: test_handshake(),
+        };
+        assert!(matches!(
+            ptx_to_cubin(request, b"ptx", "kernel.ptx", "sm_86", false, DebugPolicy::None),
+            Err(MaterializeError::MissingPtxasProvenance)
+        ));
+    }
+
+    #[test]
+    fn materialization_options_preserve_fma_and_debug_policy() {
+        for allow_fma in [false, true] {
+            for debug in [DebugPolicy::None, DebugPolicy::LineTables, DebugPolicy::Full] {
+                let options = options("sm_86", allow_fma, debug).unwrap();
+                assert_eq!(options.allow_fma_contraction(), allow_fma);
+                assert_eq!(options.debug_policy(), debug);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires discoverable CUDA Toolkit ptxas"]
+    fn live_ptx_materialization_preserves_policy_and_returns_resources() {
+        let assembler = PtxAssembler::discover().unwrap();
+        let request = MaterializationRequest {
+            tool_identity_handshake: test_handshake()
+                .with_ptxas(assembler.ptxas_digest().unwrap()),
+        };
+        let ptx = b".version 7.1\n.target sm_86\n.address_size 64\n\
+            .visible .entry kernel() { ret; }\n";
+        for (allow_fma, debug) in [
+            (false, DebugPolicy::None),
+            (false, DebugPolicy::LineTables),
+            (true, DebugPolicy::Full),
+        ] {
+            let cubin = ptx_to_cubin(
+                request, ptx, "kernel.ptx", "sm_86", allow_fma, debug,
+            ).unwrap();
+            assert!(cuda_artifact_finalizer::is_valid_cubin(&cubin.bytes));
+            assert!(cubin.resource_usage.iter().any(|usage| usage.kernel == "kernel"));
+        }
     }
 
     #[test]

@@ -3213,8 +3213,10 @@ device-owner = { path = "../device-owner" }
         &[],
         None,
     );
-    assert_eq!(arch_switch.get("shared_dep"), Some(&true));
-    assert_eq!(arch_switch.get("tracked_macro"), Some(&true));
+    // Architecture cfgs are visible to all Rust source and therefore change
+    // global rustflags; only output-mode changes below are device-owner scoped.
+    assert_eq!(arch_switch.get("shared_dep"), Some(&false));
+    assert_eq!(arch_switch.get("tracked_macro"), Some(&false));
     assert_eq!(arch_switch.get("device_owner"), Some(&false));
     assert_eq!(arch_switch.get("device-consumer"), Some(&false));
 
@@ -3983,7 +3985,7 @@ fn apply_output_mode_sets_nvvm_ir_flag_and_target() {
 }
 
 #[test]
-fn materialization_forces_nvvm_ir_and_exact_provenance_handshake() {
+fn materialization_preserves_codegen_route_and_sets_exact_provenance_handshake() {
     let mut cmd = Command::new("cargo");
     let materialization = MaterializationMode {
         prepared: Some(PreparedMaterialization {
@@ -3994,10 +3996,7 @@ fn materialization_forces_nvvm_ir_and_exact_provenance_handshake() {
 
     apply_output_mode(&mut cmd, false, Some("sm_90"), &materialization);
 
-    assert_eq!(
-        command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR").as_deref(),
-        Some("1")
-    );
+    assert_eq!(command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR"), None);
     assert_eq!(command_env(&cmd, MATERIALIZE_ENV).as_deref(), Some("1"));
     assert_eq!(
         command_env(&cmd, MATERIALIZER_HANDSHAKE_ENV).as_deref(),
@@ -4007,6 +4006,38 @@ fn materialization_forces_nvvm_ir_and_exact_provenance_handshake() {
         command_env(&cmd, EXPECTED_PROVENANCE_ENV).as_deref(),
         Some("4242424242424242424242424242424242424242424242424242424242424242")
     );
+
+    for value in ["0", "1"] {
+        cmd.env("CUDA_OXIDE_EMIT_NVVM_IR", value);
+        apply_output_mode(&mut cmd, false, Some("sm_90"), &materialization);
+        assert_eq!(command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR").as_deref(), Some(value));
+    }
+}
+
+#[test]
+fn materialization_fingerprint_preserves_configured_codegen_route() {
+    let ctx = test_context(OxideConfig::default());
+    let materialization = MaterializationMode {
+        prepared: Some(PreparedMaterialization {
+            provenance_sha256_hex: "42".repeat(32),
+            tool_identity_handshake_json: "{\"version\":1}".to_string(),
+        }),
+    };
+    let fingerprint = |value: &str| {
+        standard_codegen_fingerprint_with_env(
+            &ctx,
+            false,
+            false,
+            false,
+            DeviceDebug::Off,
+            false,
+            Some("sm_90"),
+            None,
+            &materialization,
+            &BTreeMap::from([("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), value.as_bytes().to_vec())]),
+        )
+    };
+    assert_ne!(fingerprint("0"), fingerprint("1"));
 }
 
 #[test]

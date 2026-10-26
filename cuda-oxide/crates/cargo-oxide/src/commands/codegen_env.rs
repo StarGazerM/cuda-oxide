@@ -557,7 +557,7 @@ pub(super) fn apply_output_mode(
         cmd.env("CUDA_OXIDE_TARGET", target_arch);
         append_architecture_cfgs(cmd, target_arch);
     }
-    if emit_nvvm_ir || materialization.enabled() {
+    if emit_nvvm_ir {
         cmd.env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
     }
     materialization.apply(cmd);

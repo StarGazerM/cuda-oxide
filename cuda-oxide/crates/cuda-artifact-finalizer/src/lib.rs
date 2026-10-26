@@ -16,6 +16,7 @@ mod nvvm;
 mod options;
 mod provenance;
 mod ptx;
+pub mod ptx_merge;
 mod validation;
 
 pub use diagnostics::KernelResourceUsage;

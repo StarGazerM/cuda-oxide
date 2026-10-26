@@ -17,7 +17,7 @@ const DIGEST_DOMAIN: &[u8] = b"cuda-oxide/artifact-finalizer/digest/v1";
 // Bump this recipe version whenever tool invocation, option translation,
 // input ordering, output validation, or other output-affecting semantics
 // change. Cache keys and the cargo-oxide/backend handshake rely on it.
-const RECIPE: &[u8] = b"cuda-oxide/artifact-finalizer/recipe/v2";
+const RECIPE: &[u8] = b"cuda-oxide/artifact-finalizer/recipe/v3";
 
 /// Exact compiler inputs discovered alongside the loaded CUDA tools.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +130,9 @@ pub struct MaterializerHandshakeV1 {
     pub nvjitlink: PinnedToolProvenance,
     /// SHA-256 of the libdevice bytes supplied to libNVVM.
     pub libdevice_sha256: [u8; 32],
+    /// Exact standalone assembler used for retained PTX inputs, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptxas_sha256: Option<[u8; 32]>,
 }
 
 impl MaterializerHandshakeV1 {
@@ -152,18 +155,41 @@ impl MaterializerHandshakeV1 {
             libnvvm,
             nvjitlink,
             libdevice_sha256,
+            ptxas_sha256: None,
+        }
+    }
+
+    /// Include the standalone assembler in Cargo's semantic provenance.
+    pub fn with_ptxas(mut self, ptxas_sha256: [u8; 32]) -> Self {
+        self.ptxas_sha256 = Some(ptxas_sha256);
+        self.provenance_sha256 = self.materializer_provenance_digest();
+        self
+    }
+
+    /// Provenance for the NVVM/LTO tools, independent of standalone PTX assembly.
+    pub fn ir_provenance_digest(&self) -> [u8; 32] {
+        common_provenance_digest(
+            &self.libnvvm.sha256,
+            &self.nvjitlink.sha256,
+            &self.libdevice_sha256,
+        )
+    }
+
+    fn materializer_provenance_digest(&self) -> [u8; 32] {
+        let ir = self.ir_provenance_digest();
+        match self.ptxas_sha256 {
+            Some(ptxas) => StableDigest::new()
+                .field("ir-provenance", ir)
+                .field("ptxas-sha256", ptxas)
+                .finish(),
+            None => ir,
         }
     }
 
     /// Whether the version and combined digest agree with all named fields.
     pub fn has_consistent_provenance(&self) -> bool {
         self.version == Self::VERSION
-            && self.provenance_sha256
-                == common_provenance_digest(
-                    &self.libnvvm.sha256,
-                    &self.nvjitlink.sha256,
-                    &self.libdevice_sha256,
-                )
+            && self.provenance_sha256 == self.materializer_provenance_digest()
     }
 }
 
@@ -452,6 +478,21 @@ mod tests {
             serde_json::from_str::<MaterializerHandshakeV1>(&json).unwrap(),
             handshake
         );
+        let with_ptxas = handshake.with_ptxas([4; 32]);
+        assert!(with_ptxas.has_consistent_provenance());
+        assert_ne!(with_ptxas.provenance_sha256, handshake.provenance_sha256);
+        assert_eq!(with_ptxas.ir_provenance_digest(), handshake.provenance_sha256);
+        assert_eq!(
+            serde_json::from_str::<MaterializerHandshakeV1>(
+                &serde_json::to_string(&with_ptxas).unwrap()
+            ).unwrap(),
+            with_ptxas
+        );
+        let mut changed = with_ptxas;
+        changed.ptxas_sha256 = Some([5; 32]);
+        assert!(!changed.has_consistent_provenance());
+        changed.ptxas_sha256 = None;
+        assert!(!changed.has_consistent_provenance());
         let with_unknown = json.replacen('{', "{\"family.0\":0,", 1);
         assert!(serde_json::from_str::<MaterializerHandshakeV1>(&with_unknown).is_err());
     }

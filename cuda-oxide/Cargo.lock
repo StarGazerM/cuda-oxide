@@ -376,6 +376,8 @@ version = "0.2.1"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
+ "oxide-artifacts 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ptx-parse",
  "serde",
  "serde_json",
  "sha2",

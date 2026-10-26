@@ -47,8 +47,7 @@ impl MaterializationMode {
                 .env(
                     MATERIALIZER_HANDSHAKE_ENV,
                     &prepared.tool_identity_handshake_json,
-                )
-                .env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
+                );
         }
     }
 }
@@ -314,6 +313,15 @@ pub fn print_materializer_handshake() {
         );
         std::process::exit(1);
     });
+    let assembler = cuda_artifact_finalizer::PtxAssembler::discover().unwrap_or_else(|error| {
+        eprintln!("could not discover CUDA PTX assembler: {error}");
+        std::process::exit(1);
+    });
+    let ptxas_digest = assembler.ptxas_digest().unwrap_or_else(|| {
+        eprintln!("the discovered ptxas executable changed before Cargo fingerprinting");
+        std::process::exit(1);
+    });
+    let handshake = handshake.with_ptxas(ptxas_digest);
     println!(
         "{}",
         serde_json::to_string(&handshake).unwrap_or_else(|error| {

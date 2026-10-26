@@ -3,27 +3,29 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Final host-link device image. Rlibs retain compiler IR alongside their
-//! anchored cubins; no dependency on host archive extraction or runtime JIT.
+//! Final host-link device image. Rlibs retain ordinary PTX or required compiler
+//! IR alongside anchored cubins; no host archive extraction or runtime JIT.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use cuda_artifact_finalizer::{DebugPolicy, FinalizationOptions, FinalizerOutput, NamedInput};
+use cuda_artifact_finalizer::ptx_merge::merge_ptx_bundles;
 use oxide_artifacts::{
     ArtifactBundleSpec, ArtifactCompileOptions, ArtifactDebugPolicy, ArtifactEntrySpec,
-    ArtifactPayloadKind, ArtifactPayloadSpec, OwnedArtifactBundle,
+    ArtifactPayloadKind, ArtifactPayloadSpec, OwnedArtifactBundle, OwnedArtifactPayload,
 };
 use reserved_oxide_symbols::LINKED_CUBIN_BUNDLE_NAME;
 
-use crate::materialize::{MaterializationRequest, checked_finalizer};
+use crate::materialize::{MaterializationRequest, checked_finalizer, checked_ptx_assembler};
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 const LINK_INPUT_BUNDLE_PREFIX: &str = "__cuda_oxide_link_input:";
 pub(crate) const LINK_INPUT_MODULE_PREFIX: &str = "oxide_artifact_link_input_";
 
-/// Only the cubin object has host anchors. The separate IR object is archived
+/// Only the cubin object has host anchors. The separate PTX/IR object is archived
 /// for subsequent device links, never extracted by ordinary host linking.
 pub(crate) fn build_artifact_objects<'a>(
     mut runtime: ArtifactBundleSpec<'a>,
@@ -51,7 +53,7 @@ pub(crate) fn build_artifact_objects<'a>(
         use object::Object as _;
         // Match the already-validated runtime object's host format. SHF_EXCLUDE
         // also protects mixed rlib+shared-library output invocations and host
-        // whole-archive links: IR survives archiving but not image linking.
+        // whole-archive links: PTX/IR survives archiving but not image linking.
         let host = object::File::parse(runtime_object.as_slice())?;
         let mut object = object::write::Object::new(
             host.format(), host.architecture(), host.endianness(),
@@ -74,7 +76,7 @@ pub(crate) fn build_artifact_objects<'a>(
 /// Pair every runtime cubin with its compile-only input before discarding the
 /// runtime bundles. Names alone are insufficient: also require identical entry
 /// metadata, target and compiler policy. Stale combined-payload bundles and
-/// ordinary, non-AOT IR are rejected rather than silently linked.
+/// ordinary, non-AOT inputs are rejected rather than silently linked.
 fn select_link_inputs(bundles: Vec<OwnedArtifactBundle>) -> Result<Vec<OwnedArtifactBundle>> {
     let mut inputs = BTreeMap::new();
     let mut runtime = Vec::new();
@@ -84,7 +86,7 @@ fn select_link_inputs(bundles: Vec<OwnedArtifactBundle>) -> Result<Vec<OwnedArti
         }
         if let Some(identity) = bundle.name.strip_prefix(LINK_INPUT_BUNDLE_PREFIX) {
             if bundle.payloads.len() != 1
-                || !matches!(bundle.payloads[0].kind, ArtifactPayloadKind::NvvmIr | ArtifactPayloadKind::Ltoir)
+                || !is_link_input(bundle.payloads[0].kind)
             {
                 return Err(format!("invalid compile-only AOT bundle {}", bundle.name).into());
             }
@@ -110,13 +112,13 @@ fn select_link_inputs(bundles: Vec<OwnedArtifactBundle>) -> Result<Vec<OwnedArti
     for bundle in &runtime {
         let identity = &bundle.payloads[0].name;
         let input = inputs.get(identity).ok_or_else(|| format!(
-            "AOT cubin {} has no compile-only IR input for {identity}; rebuild the dependency with --materialize-cubin",
+            "AOT cubin {} has no compile-only PTX/IR input for {identity}; rebuild the dependency with --materialize-cubin",
             bundle.name,
         ))?;
         if bundle.target != input.target || bundle.compile_options != input.compile_options
             || bundle.entries != input.entries
         {
-            return Err(format!("AOT cubin/IR metadata mismatch for {identity}").into());
+            return Err(format!("AOT cubin/input metadata mismatch for {identity}").into());
         }
         paired.insert(identity.as_str());
     }
@@ -164,6 +166,10 @@ pub(crate) fn gather(paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<Own
     select_link_inputs(bundles)
 }
 
+fn is_link_input(kind: ArtifactPayloadKind) -> bool {
+    matches!(kind, ArtifactPayloadKind::Ptx | ArtifactPayloadKind::NvvmIr | ArtifactPayloadKind::Ltoir)
+}
+
 fn link_policy(bundles: &[OwnedArtifactBundle]) -> Result<Option<(&str, ArtifactCompileOptions)>> {
     let Some(first) = bundles.first() else {
         return Ok(None);
@@ -176,11 +182,9 @@ fn link_policy(bundles: &[OwnedArtifactBundle]) -> Result<Option<(&str, Artifact
                 bundle.name, bundle.target, bundle.compile_options,
             ).into());
         }
-        if bundle.payload(ArtifactPayloadKind::Ltoir).is_none()
-            && bundle.payload(ArtifactPayloadKind::NvvmIr).is_none()
-        {
+        if bundle.payloads.len() != 1 || !is_link_input(bundle.payloads[0].kind) {
             return Err(format!(
-                "AOT device bundle {} has no retained NVVM IR or LTOIR; rebuild all device dependencies with --materialize-cubin",
+                "AOT device bundle {} must retain exactly one PTX, NVVM IR or LTOIR input; rebuild all device dependencies with --materialize-cubin",
                 bundle.name,
             ).into());
         }
@@ -189,8 +193,8 @@ fn link_policy(bundles: &[OwnedArtifactBundle]) -> Result<Option<(&str, Artifact
 }
 
 /// Construct the one runtime-facing generic image, with a union of entry
-/// metadata. Duplicate definitions are coalesced by NVVM weak-ODR semantics,
-/// not by dropping entire modules (which could lose unique specializations).
+/// metadata. Shared PTX merge semantics or NVVM weak-ODR semantics coalesce
+/// duplicate definitions without dropping modules with unique specializations.
 fn linked_blob(bundles: &[OwnedArtifactBundle], cubin: &[u8]) -> Result<Vec<u8>> {
     let (target, policy) = link_policy(bundles)?.ok_or("empty AOT device link")?;
     let mut entries = BTreeMap::new();
@@ -235,34 +239,69 @@ pub(crate) fn materialize(
     let options = FinalizationOptions::new(target.parse()?)
         .with_fma_contraction(policy.fma_contraction_enabled())
         .with_debug_policy(debug);
-    let finalizer = checked_finalizer(request)?;
-    // Compile each retained NVVM module separately, preserving its metadata
-    // namespace; nvJitLink, rather than textual concatenation, links the result.
-    let mut compiled = Vec::with_capacity(bundles.len());
-    for bundle in bundles {
-        compiled.push(if bundle.payload(ArtifactPayloadKind::Ltoir).is_some() {
-            None
+    let has_ptx = bundles.iter().any(|bundle| bundle.payload(ArtifactPayloadKind::Ptx).is_some());
+    let cubin = if has_ptx {
+        // The runtime merger intentionally skips non-PTX bundles. Convert every
+        // required IR input explicitly before calling it, so mixed dependency
+        // graphs cannot silently lose their IR-only kernels.
+        let ir_ptx = if bundles.iter().any(|bundle| bundle.payload(ArtifactPayloadKind::Ptx).is_none()) {
+            Some(OwnedArtifactBundle {
+                name: "__cuda_oxide_linked_ir".to_owned(),
+                target: target.to_owned(),
+                compile_options: policy,
+                entries: Vec::new(),
+                payloads: vec![OwnedArtifactPayload {
+                    kind: ArtifactPayloadKind::Ptx,
+                    name: "__cuda_oxide_linked_ir.ptx".to_owned(),
+                    bytes: link_ir(request, bundles, &options, FinalizerOutput::Ptx)?,
+                }],
+            })
         } else {
-            Some(finalizer.compiler().compile_nvvm_ir_to_ltoir(
-                &bundle.name,
-                bundle.payload(ArtifactPayloadKind::NvvmIr).expect("validated IR input"),
-                &options,
-            )?)
-        });
-    }
-    let names: Vec<_> = bundles.iter().enumerate()
-        .map(|(index, bundle)| format!("{index}-{}.ltoir", bundle.name))
-        .collect();
-    let inputs: Vec<_> = bundles.iter().zip(&compiled).zip(&names)
-        .map(|((bundle, compiled), name)| NamedInput::new(
-            name,
-            compiled.as_deref().unwrap_or_else(|| {
-                bundle.payload(ArtifactPayloadKind::Ltoir).expect("validated IR input")
-            }),
-        ))
-        .collect();
-    let cubin = finalizer.link_ltoir(&inputs, &options, FinalizerOutput::Cubin)?;
+            None
+        };
+        let merged = merge_ptx_bundles(
+            bundles.iter().filter(|bundle| bundle.payload(ArtifactPayloadKind::Ptx).is_some())
+                .chain(ir_ptx.iter()),
+        )?;
+        checked_ptx_assembler(request)?.assemble_ptx(
+            NamedInput::new("__cuda_oxide_linked.ptx", merged.as_bytes()), &options,
+        )?
+    } else {
+        link_ir(request, bundles, &options, FinalizerOutput::Cubin)?
+    };
     Ok(Some(linked_blob(bundles, &cubin)?))
+}
+
+/// Compile each required NVVM module separately to preserve its metadata
+/// namespace, then link all IR inputs together with NVVM weak-ODR semantics.
+fn link_ir(
+    request: MaterializationRequest,
+    bundles: &[OwnedArtifactBundle],
+    options: &FinalizationOptions,
+    output: FinalizerOutput,
+) -> Result<Vec<u8>> {
+    let finalizer = checked_finalizer(request)?;
+    let compiled: Vec<_> = bundles.iter().enumerate()
+        .filter(|(_, bundle)| bundle.payload(ArtifactPayloadKind::Ptx).is_none())
+        .map(|(index, bundle)| -> Result<_> {
+            let bytes = if let Some(ltoir) = bundle.payload(ArtifactPayloadKind::Ltoir) {
+                Cow::Borrowed(ltoir)
+            } else {
+                Cow::Owned(finalizer.compiler().compile_nvvm_ir_to_ltoir(
+                    &bundle.name,
+                    bundle.payload(ArtifactPayloadKind::NvvmIr).ok_or_else(|| {
+                        format!("AOT device bundle {} has no retained IR input", bundle.name)
+                    })?,
+                    options,
+                )?)
+            };
+            Ok((format!("{index}-{}.ltoir", bundle.name), bytes))
+        })
+        .collect::<Result<_>>()?;
+    let inputs: Vec<_> = compiled.iter()
+        .map(|(name, bytes)| NamedInput::new(name, bytes))
+        .collect();
+    Ok(finalizer.link_ltoir(&inputs, options, output)?)
 }
 
 #[cfg(test)]
@@ -289,53 +328,56 @@ mod tests {
         }
     }
 
-    fn paired_objects(anchor: &str) -> (Vec<u8>, Vec<u8>) {
+    fn paired_objects(anchor: &str, kind: ArtifactPayloadKind) -> (Vec<u8>, Vec<u8>) {
         let spec = ArtifactBundleSpec::new("dependency", "sm_80")
             .with_payload(ArtifactPayloadSpec::new(ArtifactPayloadKind::Cubin, "crate.cubin", b"cubin"))
             .with_entry(ArtifactEntrySpec::new("generic_u32", ArtifactEntryKind::Kernel));
         let (runtime, input) = build_artifact_objects(
             spec,
-            Some(ArtifactPayloadSpec::new(ArtifactPayloadKind::NvvmIr, "crate.ll", b"ir")),
+            Some(ArtifactPayloadSpec::new(kind, "crate.input", b"input")),
             "x86_64-unknown-linux-gnu", anchor, "legacy",
         ).unwrap();
         (runtime, input.unwrap())
     }
 
     #[test]
-    fn runtime_cubin_and_compile_only_ir_are_separate_archive_members() {
+    fn runtime_cubin_and_compile_only_inputs_are_separate_archive_members() {
         use object::{Object, ObjectSection, ObjectSymbol};
-        let (runtime, input) = paired_objects("target_anchor");
-        let runtime_bundles = bundles_from_bytes(&runtime).unwrap();
-        assert_eq!(runtime_bundles[0].name, "dependency");
-        assert_eq!(runtime_bundles[0].payloads.len(), 1);
-        assert_eq!(runtime_bundles[0].payloads[0].kind, ArtifactPayloadKind::Cubin);
-        let runtime_file = object::File::parse(runtime.as_slice()).unwrap();
-        assert!(runtime_file.symbols().any(|symbol| symbol.name().unwrap() == "target_anchor"));
+        for kind in [ArtifactPayloadKind::Ptx, ArtifactPayloadKind::NvvmIr, ArtifactPayloadKind::Ltoir] {
+            let (runtime, input) = paired_objects("target_anchor", kind);
+            let runtime_bundles = bundles_from_bytes(&runtime).unwrap();
+            assert_eq!(runtime_bundles[0].name, "dependency");
+            assert_eq!(runtime_bundles[0].payloads.len(), 1);
+            assert_eq!(runtime_bundles[0].payloads[0].kind, ArtifactPayloadKind::Cubin);
+            let runtime_file = object::File::parse(runtime.as_slice()).unwrap();
+            assert!(runtime_file.symbols().any(|symbol| symbol.name().unwrap() == "target_anchor"));
 
-        let input_file = object::File::parse(input.as_slice()).unwrap();
-        assert!(!input_file.symbols().any(|symbol| symbol.is_global() && symbol.is_definition()));
-        let section = input_file.section_by_name(oxide_artifacts::ARTIFACT_SECTION_NAME).unwrap();
-        assert!(matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
-            if sh_flags & object::elf::SHF_EXCLUDE as u64 != 0));
+            let input_file = object::File::parse(input.as_slice()).unwrap();
+            assert!(!input_file.symbols().any(|symbol| symbol.is_global() && symbol.is_definition()));
+            let section = input_file.section_by_name(oxide_artifacts::ARTIFACT_SECTION_NAME).unwrap();
+            assert!(matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
+                if sh_flags & object::elf::SHF_EXCLUDE as u64 != 0));
 
-        let mut archive = b"!<arch>\n".to_vec();
-        archive_member(&mut archive, "lib.rmeta/", b"metadata");
-        archive_member(&mut archive, "runtime.o/", &runtime);
-        archive_member(&mut archive, "input.o/", &input);
-        let found = select_link_inputs(bundles_from_bytes(&archive).unwrap()).unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].payloads.len(), 1);
-        assert_eq!(found[0].payload(ArtifactPayloadKind::NvvmIr), Some(b"ir".as_slice()));
-        let bytes = linked_blob(&found, b"linked cubin").unwrap();
-        let linked = parse_artifact_blob(&bytes).unwrap();
-        assert_eq!(linked.name, LINKED_CUBIN_BUNDLE_NAME);
-        assert!(linked.entry("generic_u32").is_some());
-        assert!(linked.payload(ArtifactPayloadKind::NvvmIr).is_none());
+            let mut archive = b"!<arch>\n".to_vec();
+            archive_member(&mut archive, "lib.rmeta/", b"metadata");
+            archive_member(&mut archive, "runtime.o/", &runtime);
+            archive_member(&mut archive, "input.o/", &input);
+            let found = select_link_inputs(bundles_from_bytes(&archive).unwrap()).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].payloads.len(), 1);
+            assert_eq!(found[0].payload(kind), Some(b"input".as_slice()));
+            let bytes = linked_blob(&found, b"linked cubin").unwrap();
+            let linked = parse_artifact_blob(&bytes).unwrap();
+            assert_eq!(linked.name, LINKED_CUBIN_BUNDLE_NAME);
+            assert!(linked.entry("generic_u32").is_some());
+            assert_eq!(linked.payloads.len(), 1);
+            assert_eq!(linked.payloads[0].kind, ArtifactPayloadKind::Cubin);
+        }
     }
 
     #[test]
     fn pairing_rejects_missing_mismatched_and_unmaterialized_inputs() {
-        let (runtime, input) = paired_objects("target_anchor");
+        let (runtime, input) = paired_objects("target_anchor", ArtifactPayloadKind::Ptx);
         let mut paired = bundles_from_bytes(&runtime).unwrap();
         assert!(select_link_inputs(paired.clone()).is_err());
         assert!(select_link_inputs(bundles_from_bytes(&input).unwrap()).is_err());
@@ -346,7 +388,7 @@ mod tests {
         assert!(select_link_inputs(vec![bundle("ordinary_nvvm", &[])]).is_err());
 
         // Same package runtime name does not pair different Cargo targets.
-        let (other_runtime, _) = paired_objects("other_target");
+        let (other_runtime, _) = paired_objects("other_target", ArtifactPayloadKind::Ptx);
         let mut mismatched = bundles_from_bytes(&other_runtime).unwrap();
         mismatched.extend(bundles_from_bytes(&input).unwrap());
         assert!(select_link_inputs(mismatched).is_err());
@@ -361,6 +403,73 @@ mod tests {
         assert_eq!(linked.payloads.len(), 1);
         assert_eq!(linked.payload(ArtifactPayloadKind::Cubin), Some(b"linked cubin".as_slice()));
         assert_eq!(linked.entries.iter().map(|entry| entry.symbol).collect::<Vec<_>>(), ["generic_u32", "generic_u64", "shared"]);
+    }
+
+    #[test]
+    fn mixed_retained_inputs_are_all_paired_and_included_in_final_metadata() {
+        let mut artifacts = Vec::new();
+        for (anchor, kind) in [
+            ("ptx_target", ArtifactPayloadKind::Ptx),
+            ("nvvm_target", ArtifactPayloadKind::NvvmIr),
+            ("ltoir_target", ArtifactPayloadKind::Ltoir),
+        ] {
+            let (runtime, input) = paired_objects(anchor, kind);
+            artifacts.extend(bundles_from_bytes(&runtime).unwrap());
+            artifacts.extend(bundles_from_bytes(&input).unwrap());
+        }
+        let inputs = select_link_inputs(artifacts).unwrap();
+        assert_eq!(inputs.len(), 3);
+        assert!(link_policy(&inputs).unwrap().is_some());
+        for kind in [ArtifactPayloadKind::Ptx, ArtifactPayloadKind::NvvmIr, ArtifactPayloadKind::Ltoir] {
+            assert_eq!(inputs.iter().filter(|bundle| bundle.payload(kind).is_some()).count(), 1);
+        }
+        let blob = linked_blob(&inputs, b"linked cubin").unwrap();
+        let linked = parse_artifact_blob(&blob).unwrap();
+        assert_eq!(linked.payloads.len(), 1);
+        assert_eq!(linked.payloads[0].kind, ArtifactPayloadKind::Cubin);
+        assert!(linked.entry("generic_u32").is_some());
+    }
+
+    #[test]
+    fn retained_ptx_uses_shared_merger_for_generic_specializations() {
+        let mut bundles = [
+            bundle("dependency", &["generic_u32"]),
+            bundle("consumer", &["generic_u64"]),
+        ];
+        for (bundle, entry) in bundles.iter_mut().zip(["generic_u32", "generic_u64"]) {
+            bundle.payloads[0].kind = ArtifactPayloadKind::Ptx;
+            bundle.payloads[0].bytes = format!(
+                ".version 8.0\n.target sm_80\n.address_size 64\n\
+                 .visible .func helper() {{ ret; }}\n.visible .entry {entry}() {{ ret; }}\n"
+            ).into_bytes();
+        }
+        assert!(link_policy(&bundles).unwrap().is_some());
+        let merged = merge_ptx_bundles(&bundles).unwrap();
+        assert_eq!(merged.matches(".func helper()").count(), 1);
+        assert!(merged.contains(".entry generic_u32()"));
+        assert!(merged.contains(".entry generic_u64()"));
+        let blob = linked_blob(&bundles, b"linked cubin").unwrap();
+        let linked = parse_artifact_blob(&blob).unwrap();
+        assert!(linked.entry("generic_u32").is_some());
+        assert!(linked.entry("generic_u64").is_some());
+        assert!(linked.payload(ArtifactPayloadKind::Ptx).is_none());
+    }
+
+    #[test]
+    fn ambiguous_and_unsupported_retained_payloads_are_rejected() {
+        let mut input = bundle("ambiguous", &[]);
+        input.payloads.push(OwnedArtifactPayload {
+            kind: ArtifactPayloadKind::Ptx,
+            name: "crate.ptx".into(),
+            bytes: b"ptx".to_vec(),
+        });
+        assert!(link_policy(std::slice::from_ref(&input)).is_err());
+        input.name = format!("{LINK_INPUT_BUNDLE_PREFIX}target");
+        assert!(select_link_inputs(vec![input]).is_err());
+        let (runtime, input) = paired_objects("target", ArtifactPayloadKind::Cubin);
+        let mut artifacts = bundles_from_bytes(&runtime).unwrap();
+        artifacts.extend(bundles_from_bytes(&input).unwrap());
+        assert!(select_link_inputs(artifacts).is_err());
     }
 
     #[test]

@@ -1107,7 +1107,7 @@ fn write_device_artifact_object(
             oxide_artifacts::ArtifactPayloadKind::Cubin
         }
     };
-    // Preserve the actual policy even after IR has become a cubin. Consumers
+    // Preserve the actual policy after PTX or IR becomes a cubin. Consumers
     // and diagnostics must not mistake `--no-fmad` materialization for a
     // default-policy artifact merely because no compilation remains to do.
     let carries_compile_policy = was_materialized
@@ -1130,13 +1130,18 @@ fn write_device_artifact_object(
         ));
     let link_payload = link_input.map(|input| {
         let kind = match input.kind {
+            device_codegen::DeviceCodegenArtifactKind::Ptx => {
+                oxide_artifacts::ArtifactPayloadKind::Ptx
+            }
             device_codegen::DeviceCodegenArtifactKind::NvvmIr => {
                 oxide_artifacts::ArtifactPayloadKind::NvvmIr
             }
             device_codegen::DeviceCodegenArtifactKind::Ltoir => {
                 oxide_artifacts::ArtifactPayloadKind::Ltoir
             }
-            _ => unreachable!("materialization accepts only compiler IR"),
+            device_codegen::DeviceCodegenArtifactKind::Cubin => {
+                unreachable!("materialization rejects already-built cubins")
+            }
         };
         oxide_artifacts::ArtifactPayloadSpec::new(kind, &input.name, &input.bytes)
     });
@@ -1208,16 +1213,13 @@ fn embedded_compile_options(
     }
 }
 
-/// Opt-in (`CUDA_OXIDE_MATERIALIZE_CUBIN`): compile NVVM IR / LTOIR
-/// artifacts down to a final cubin before embedding, so the consuming
-/// binary loads device code directly through the CUDA driver — no libNVVM
-/// or nvJitLink on the deployment host and no first-load compile hit. The
-/// cubin is pinned to the emitted architecture; the default (embed the IR,
-/// compile at load) keeps cuda-host's execution routing, including the PTX
-/// bridge to newer GPUs. Once requested, this path fails closed unless codegen
-/// produced NVVM IR or LTOIR; accepting PTX or an already-built cubin would
-/// bypass the wrapper's provenance-checked finalization recipe. See
-/// `materialize` for the trade-offs.
+/// Opt-in (`CUDA_OXIDE_MATERIALIZE_CUBIN`): finalize the ordinary PTX, NVVM IR,
+/// or LTOIR artifact before embedding without changing its codegen route.
+/// PTX uses ptxas with the same FMA/debug policy; IR keeps the NVVM/LTO route.
+/// Deployment loads a target-specific cubin without compiler libraries or a
+/// first-load compile hit. The original input is retained only for build-time
+/// cross-crate linking. Already-built cubins are rejected because they bypass
+/// the wrapper's provenance-checked finalization recipe.
 struct MaterializedDeviceArtifact {
     artifact: device_codegen::DeviceCodegenArtifact,
     resource_usage: Vec<cuda_artifact_finalizer::KernelResourceUsage>,
@@ -1256,9 +1258,14 @@ fn materialize_artifact_for_embedding(
             result.allow_fma_contraction,
             debug_policy,
         )?,
-        device_codegen::DeviceCodegenArtifactKind::Ptx => {
-            return Err(Box::new(materialize::MaterializeError::PtxInput));
-        }
+        device_codegen::DeviceCodegenArtifactKind::Ptx => materialize::ptx_to_cubin(
+            request,
+            &artifact.bytes,
+            &artifact.name,
+            &result.target,
+            result.allow_fma_contraction,
+            debug_policy,
+        )?,
         device_codegen::DeviceCodegenArtifactKind::Cubin => {
             return Err(Box::new(materialize::MaterializeError::CubinInput));
         }

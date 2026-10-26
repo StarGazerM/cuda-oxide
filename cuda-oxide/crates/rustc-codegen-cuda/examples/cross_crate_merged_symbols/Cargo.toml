@@ -16,3 +16,4 @@ merged-symbols-lib = { path = "merged-symbols-lib" }
 cuda-device = { path = "../../../cuda-device" }
 cuda-host = { path = "../../../cuda-host" }
 cuda-core = { path = "../../../../../cuda-core" }
+cuda-artifact-finalizer = { path = "../../../cuda-artifact-finalizer" }
