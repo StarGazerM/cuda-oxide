@@ -643,6 +643,31 @@ fn generate_ptx_impl(
     };
     let post_link_input: &Path = linked.as_deref().unwrap_or(module.llvm_ir);
 
+    // Kernels never call one another: large modules split into kernel groups
+    // whose `opt` and `llc` run concurrently (see `ptx_partition`). Debug
+    // builds and modules a split could change stay whole.
+    if matches!(debug_kind, DebugKind::Off)
+        && let Some(opt) = toolchain.opt.as_ref()
+        && let Some(generated_ptx) = generate_partitioned_ptx(
+            PartitionedInput {
+                ir: post_link_input,
+                module: &module,
+                toolchain,
+                opt,
+                opts,
+                target: &target,
+                requirements,
+                generated,
+                libdevice_linked: linked.is_some(),
+                strict: strict_optimization,
+            },
+            &mut diagnostics,
+            diagnostic_sink,
+        )?
+    {
+        return Ok(generated_ptx);
+    }
+
     // Run the LLVM middle-end (opt -O2) before llc. Source requirements are
     // detected above so target selection cannot lose a source-level contract
     // merely because optimization elides it. Requirements are detected again
@@ -737,10 +762,60 @@ fn generate_ptx_impl(
         );
     }
 
+    let mut llc_cmd = llc_command(
+        toolchain,
+        &target,
+        requirements,
+        debug_kind,
+        opts,
+        linked.is_some(),
+    )?;
+    let result = llc_cmd.arg(llc_input).arg("-o").arg(module.output).output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            reject_dropped_debug_info(&llc_desc, &output.stderr, debug_kind)
+                .map_err(PipelineError::PtxGeneration)?;
+            verify_no_shared_symbols_in_initializers(module.output)?;
+            verify_no_leaked_intrinsic_externs(module.output)?;
+            if matches!(debug_kind, DebugKind::LineTables) {
+                strip_target_debug_from_ptx(module.output)?;
+                if opts.verbose {
+                    record_diagnostic(
+                        &mut diagnostics,
+                        diagnostic_sink,
+                        "line-table debug: stripped PTX target debug flag; source line tables remain"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(GeneratedPtx {
+                target: target.to_string(),
+                diagnostics,
+            })
+        }
+        Ok(output) => Err(PipelineError::PtxGeneration(format!(
+            "{} failed:\n{}",
+            llc_desc,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+        Err(e) => Err(PipelineError::PtxGeneration(format!("{llc_desc}: {e}"))),
+    }
+}
+
+/// The `llc` invocation for one LLVM input, without input and output paths.
+fn llc_command(
+    toolchain: &LlvmToolchain,
+    target: &cuda_target_spec::CudaArch,
+    requirements: ModuleRequirements,
+    debug_kind: DebugKind,
+    opts: &BackendOptions,
+    libdevice_linked: bool,
+) -> Result<std::process::Command, PipelineError> {
     let mut llc_cmd = std::process::Command::new(&toolchain.llc_path);
     llc_cmd.args(base_llc_args(&target.sm()));
     if let Some(feature) = required_ptx_feature(
-        &target,
+        target,
         ptx_isa_with_debug_floor(requirements.ptx_isa, debug_kind),
     )
     .map_err(PipelineError::PtxGeneration)?
@@ -777,42 +852,216 @@ fn generate_ptx_impl(
     // module, emitting neither a warning nor a failure, and any libdevice
     // build that does branch on `__CUDA_PREC_DIV` needs the same
     // nvcc-matching value.
-    if linked.is_some() {
+    if libdevice_linked {
         llc_cmd
             .arg("--nvvm-reflect-add=__CUDA_PREC_SQRT=1")
             .arg("--nvvm-reflect-add=__CUDA_PREC_DIV=1");
     }
-    let result = llc_cmd.arg(llc_input).arg("-o").arg(module.output).output();
+    Ok(llc_cmd)
+}
 
-    match result {
-        Ok(output) if output.status.success() => {
-            reject_dropped_debug_info(&llc_desc, &output.stderr, debug_kind)
-                .map_err(PipelineError::PtxGeneration)?;
-            verify_no_shared_symbols_in_initializers(module.output)?;
-            verify_no_leaked_intrinsic_externs(module.output)?;
-            if matches!(debug_kind, DebugKind::LineTables) {
-                strip_target_debug_from_ptx(module.output)?;
-                if opts.verbose {
-                    record_diagnostic(
-                        &mut diagnostics,
-                        diagnostic_sink,
-                        "line-table debug: stripped PTX target debug flag; source line tables remain"
-                            .to_string(),
-                    );
+struct PartitionedInput<'a> {
+    ir: &'a Path,
+    module: &'a PtxModule<'a>,
+    toolchain: &'a LlvmToolchain,
+    opt: &'a crate::llvm_tools::OptTool,
+    opts: &'a BackendOptions,
+    target: &'a cuda_target_spec::CudaArch,
+    requirements: ModuleRequirements,
+    generated: &'a GeneratedModuleRequirements,
+    libdevice_linked: bool,
+    strict: bool,
+}
+
+/// Run `opt` and `llc` per kernel group in parallel and merge the PTX.
+///
+/// `Ok(None)` means the module stays whole: no split applies, or a non-strict
+/// optimization failed and the single-module path reports it as usual.
+fn generate_partitioned_ptx(
+    input: PartitionedInput<'_>,
+    diagnostics: &mut Vec<String>,
+    diagnostic_sink: Option<fn(&str)>,
+) -> Result<Option<GeneratedPtx>, PipelineError> {
+    let requested = crate::ptx_partition::requested_parts();
+    if requested < 2 {
+        return Ok(None);
+    }
+    let ir = std::fs::read_to_string(input.ir).map_err(|error| {
+        PipelineError::Optimization(format!("failed to read {}: {error}", input.ir.display()))
+    })?;
+    let Some(parts) = crate::ptx_partition::plan(&ir, input.module.public_symbols, requested)
+    else {
+        return Ok(None);
+    };
+    drop(ir);
+
+    let stem = input.ir.with_extension("");
+    let file = |index: usize, extension: &str| {
+        let mut name = stem.clone().into_os_string();
+        name.push(format!(".part{index}.{extension}"));
+        PathBuf::from(name)
+    };
+    let paths: Vec<[PathBuf; 3]> = (0..parts.len())
+        .map(|index| [file(index, "ll"), file(index, "opt.ll"), file(index, "ptx")])
+        .collect();
+    let remove_parts = |paths: &[[PathBuf; 3]]| {
+        for path in paths.iter().flatten() {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+    for (part, [ll, _, _]) in parts.iter().zip(&paths) {
+        std::fs::write(ll, &part.ir).map_err(|error| {
+            PipelineError::Optimization(format!("failed to write {}: {error}", ll.display()))
+        })?;
+    }
+
+    let optimized = run_parallel(&parts, |index, part| {
+        let [ll, opt_ll, _] = &paths[index];
+        let args = optimization_args(&part.public).map_err(|error| error.to_string())?;
+        let output = std::process::Command::new(&input.opt.path)
+            .args(&args)
+            .arg(ll)
+            .arg("-S")
+            .arg("-o")
+            .arg(opt_ll)
+            .output()
+            .map_err(|error| format!("failed to run opt ({}): {error}", input.opt.path))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "opt ({}) failed for PTX partition {index} with status {}:\n{}",
+                input.opt.path,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    });
+    if let Some(message) = optimized.into_iter().find_map(Result::err) {
+        remove_parts(&paths);
+        return if input.strict {
+            Err(PipelineError::Optimization(message))
+        } else {
+            Ok(None)
+        };
+    }
+
+    let mut requirements = input.requirements;
+    for [_, opt_ll, _] in &paths {
+        requirements = merge_module_requirements(
+            requirements,
+            detect_module_requirements_in_llvm_file(opt_ll)?,
+        );
+    }
+    let requirements =
+        merge_generated_module_requirements_for_target(requirements, input.generated, input.target)
+            .map_err(PipelineError::PtxGeneration)?;
+    validate_target_features(input.target, requirements.features).map_err(|reason| {
+        PipelineError::TargetSelection {
+            target: input.target.sm(),
+            reason: format!("{reason} (requirements from the final LLVM input)"),
+        }
+    })?;
+    validate_ptx_isa_for_llvm_major(requirements.ptx_isa, input.toolchain.llc_major)
+        .map_err(PipelineError::PtxGeneration)?;
+    if input.opts.verbose {
+        for [_, opt_ll, _] in &paths {
+            if let Ok(local) = crate::local_memory_diagnostic::diagnose_file(opt_ll) {
+                for diagnostic in local {
+                    record_diagnostic(diagnostics, diagnostic_sink, diagnostic);
                 }
             }
-            Ok(GeneratedPtx {
-                target: target.to_string(),
-                diagnostics,
-            })
         }
-        Ok(output) => Err(PipelineError::PtxGeneration(format!(
-            "{} failed:\n{}",
-            llc_desc,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))),
-        Err(e) => Err(PipelineError::PtxGeneration(format!("{llc_desc}: {e}"))),
     }
+
+    let lowered = run_parallel(&parts, |index, _| {
+        let [_, opt_ll, ptx] = &paths[index];
+        let mut llc_cmd = llc_command(
+            input.toolchain,
+            input.target,
+            requirements,
+            DebugKind::Off,
+            input.opts,
+            input.libdevice_linked,
+        )
+        .map_err(|error| error.to_string())?;
+        let output = llc_cmd
+            .arg(opt_ll)
+            .arg("-o")
+            .arg(ptx)
+            .output()
+            .map_err(|error| format!("llc ({}): {error}", input.toolchain.llc_path))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "llc ({}) failed for PTX partition {index}:\n{}",
+                input.toolchain.llc_path,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    });
+    if let Some(message) = lowered.into_iter().find_map(Result::err) {
+        remove_parts(&paths);
+        return Err(PipelineError::PtxGeneration(message));
+    }
+
+    let ptx_parts = paths
+        .iter()
+        .map(|[_, _, ptx]| {
+            std::fs::read_to_string(ptx).map_err(|error| {
+                PipelineError::PtxGeneration(format!("failed to read {}: {error}", ptx.display()))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    remove_parts(&paths);
+    let merged = crate::ptx_partition::merge(&ptx_parts).map_err(PipelineError::PtxGeneration)?;
+    std::fs::write(input.module.output, merged).map_err(|error| {
+        PipelineError::PtxGeneration(format!(
+            "failed to write {}: {error}",
+            input.module.output.display()
+        ))
+    })?;
+    verify_no_shared_symbols_in_initializers(input.module.output)?;
+    verify_no_leaked_intrinsic_externs(input.module.output)?;
+    if input.opts.verbose {
+        record_diagnostic(
+            diagnostics,
+            diagnostic_sink,
+            format!(
+                "PTX partitions: {} kernel groups ran opt and llc in parallel ({}={requested})",
+                parts.len(),
+                crate::ptx_partition::PARTITIONS_ENV,
+            ),
+        );
+    }
+    Ok(Some(GeneratedPtx {
+        target: input.target.to_string(),
+        diagnostics: std::mem::take(diagnostics),
+    }))
+}
+
+/// Run `work` for every item on its own scoped thread, in item order.
+fn run_parallel<T: Sync>(
+    items: &[T],
+    work: impl Fn(usize, &T) -> Result<(), String> + Sync,
+) -> Vec<Result<(), String>> {
+    std::thread::scope(|scope| {
+        let work = &work;
+        let handles: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| scope.spawn(move || work(index, item)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("PTX partition worker panicked".to_string()))
+            })
+            .collect()
+    })
 }
 
 fn merge_module_requirements(
