@@ -130,9 +130,12 @@ impl FinalizationOptions {
 
     /// Semantic options for standalone PTX assembly with `ptxas`.
     pub(crate) fn ptxas_options(&self) -> Vec<String> {
+        // `--split-compile=0` spreads ptxas optimization over all CPUs. It
+        // changes compile time only: the generated SASS is identical.
         let mut options = vec![
             format!("--gpu-name={}", self.target.sm()),
             format!("--fmad={}", self.allow_fma_contraction),
+            "--split-compile=0".to_string(),
         ];
         match self.debug {
             DebugPolicy::None => {}
@@ -284,16 +287,29 @@ mod tests {
         );
 
         let base = FinalizationOptions::new("sm_90a".parse().unwrap()).with_fma_contraction(false);
-        assert_eq!(base.ptxas_options(), ["--gpu-name=sm_90a", "--fmad=false"]);
+        assert_eq!(
+            base.ptxas_options(),
+            ["--gpu-name=sm_90a", "--fmad=false", "--split-compile=0"]
+        );
         assert_eq!(
             base.clone()
                 .with_debug_policy(DebugPolicy::LineTables)
                 .ptxas_options(),
-            ["--gpu-name=sm_90a", "--fmad=false", "--generate-line-info"]
+            [
+                "--gpu-name=sm_90a",
+                "--fmad=false",
+                "--split-compile=0",
+                "--generate-line-info"
+            ]
         );
         assert_eq!(
             base.with_debug_policy(DebugPolicy::Full).ptxas_options(),
-            ["--gpu-name=sm_90a", "--fmad=false", "--device-debug"]
+            [
+                "--gpu-name=sm_90a",
+                "--fmad=false",
+                "--split-compile=0",
+                "--device-debug"
+            ]
         );
     }
 
