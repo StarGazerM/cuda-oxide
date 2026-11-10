@@ -17,13 +17,14 @@ use pliron::{
     attribute::attr_cast,
     builtin::{
         attr_interfaces::TypedAttrInterface,
-        attributes::{StringAttr, TypeAttr},
-        op_interfaces::SymbolOpInterface,
+        attributes::{IdentifierAttr, StringAttr, TypeAttr},
+        op_interfaces::ATTR_KEY_SYM_NAME,
         type_interfaces::FunctionTypeInterface,
         types::{FunctionType, IntegerType, Signedness},
     },
     common_traits::Verify,
     context::{Context, Ptr},
+    identifier::Identifier,
     linked_list::ContainsLinkedList,
     op::Op,
     operation::Operation,
@@ -242,7 +243,17 @@ fn resolve_in_symbol_block(
         .iter(ctx)
         .find_map(|candidate| {
             let function = super::MirFuncOp::wrap(ctx, candidate)?;
-            (function.get_symbol_name(ctx).to_string() == callee_name).then_some(function)
+            // Every call verified scans the module's functions, so compare
+            // the stored name in place instead of copying it out.
+            let defines_callee = candidate
+                .deref(ctx)
+                .attributes
+                .get::<IdentifierAttr>(&ATTR_KEY_SYM_NAME)
+                .is_some_and(|name| {
+                    let name: &Identifier = name.as_ref();
+                    AsRef::<str>::as_ref(name) == callee_name
+                });
+            defines_callee.then_some(function)
         })
         .map_or(
             CallResolution::AttachedUnresolved,
@@ -443,6 +454,7 @@ mod tests {
         basic_block::BasicBlock,
         builtin::{
             attributes::TypeAttr,
+            op_interfaces::SymbolOpInterface,
             ops::ModuleOp,
             types::{FunctionType, IntegerType, Signedness},
         },

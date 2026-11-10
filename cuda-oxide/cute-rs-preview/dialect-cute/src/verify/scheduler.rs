@@ -26,6 +26,7 @@ use super::{
         OrdinaryFacts, poison_missing_forwarding_sources, propagate_ordinary_plumbing,
         seed_unknown_integer_carriers,
     },
+    scope_has_any,
 };
 use crate::{
     attributes::CuteTileGridAttr,
@@ -198,6 +199,9 @@ fn scheduler_guard(
 /// Check one scheduler's state origins, loop advance, work guard, and coordinate consumers.
 pub(super) fn verify_scheduler_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -> Result {
     let ids = scheduler_semantic_ids();
+    if !scope_has_any(ctx, all_ops, &ids) {
+        return Ok(());
+    }
     let facts = build_scheduler_facts(ctx, all_ops);
     let mut roots = HashSet::new();
     let mut has_work_roots = HashSet::new();

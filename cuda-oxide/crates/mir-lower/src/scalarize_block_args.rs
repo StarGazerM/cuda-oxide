@@ -8,7 +8,7 @@
 //!
 //! # Why this pass exists
 //!
-//! pliron's `mem2reg` promotes a stack slot into a block argument of the
+//! `mem2reg` promotes a stack slot into a block argument of the
 //! slot's complete type. For an enum local such as `Option<(f32, f32)>` (an
 //! iterator's `next()` result), the control-flow join therefore carries one
 //! block argument of the whole aggregate, which the textual exporter prints

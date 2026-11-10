@@ -35,21 +35,20 @@ use pliron::{
     value::Value,
 };
 
-/// Identity of a whole SSA carrier or one nested aggregate field.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CarrierKey {
-    /// The whole SSA carrier before following any aggregate field path.
-    pub(super) value: Value,
-    /// Empty means the value itself.  Non-empty paths describe a field inside
-    /// an ordinary aggregate before a matching `mir.extract_field` exposes it.
-    pub(super) path: Vec<u32>,
-}
-
 /// Monotone sets of possible semantic origins, indexed by carrier and field path.
 #[derive(Clone)]
 pub(super) struct OrdinaryFacts<F> {
-    /// Accumulated origins; multiple entries at one key represent a merge that consumers must resolve.
-    pub(super) facts: HashMap<CarrierKey, HashSet<F>>,
+    /// Accumulated origins per whole SSA carrier, then per field path inside it.
+    /// An empty path means the value itself; a non-empty path describes a field
+    /// inside an ordinary aggregate before a matching `mir.extract_field`
+    /// exposes it. Multiple origins at one path represent a merge that
+    /// consumers must resolve.
+    ///
+    /// The carrier is the outer key so forwarding one carrier's origins reads
+    /// only that carrier. Unknown-origin seeding gives every integer value in
+    /// a function an entry, and each forwarding step runs once per operation;
+    /// a flat map scanned per step is quadratic in function size.
+    facts: HashMap<Value, HashMap<Vec<u32>, HashSet<F>>>,
 }
 
 impl<F> Default for OrdinaryFacts<F> {
@@ -67,7 +66,9 @@ where
     /// Add one origin to a field path and report whether the fixed-point state changed.
     pub(super) fn insert_path(&mut self, value: Value, path: Vec<u32>, fact: F) -> bool {
         self.facts
-            .entry(CarrierKey { value, path })
+            .entry(value)
+            .or_default()
+            .entry(path)
             .or_default()
             .insert(fact)
     }
@@ -79,10 +80,7 @@ where
 
     /// Borrow the possible origins at an exact carrier field path.
     pub(super) fn at_path(&self, value: Value, path: &[u32]) -> Option<&HashSet<F>> {
-        self.facts.get(&CarrierKey {
-            value,
-            path: path.to_vec(),
-        })
+        self.facts.get(&value)?.get(path)
     }
 
     /// Borrow origins attached directly to a whole SSA carrier.
@@ -90,12 +88,22 @@ where
         self.at_path(value, &[])
     }
 
+    /// Visit every carrier field path together with its possible origins.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (Value, &[u32], &HashSet<F>)> {
+        self.facts.iter().flat_map(|(value, paths)| {
+            paths
+                .iter()
+                .map(|(path, facts)| (*value, path.as_slice(), facts))
+        })
+    }
+
     /// Collect all nested field origins carried by one SSA value.
     pub(super) fn entries(&self, value: Value) -> Vec<(Vec<u32>, F)> {
         self.facts
-            .iter()
-            .filter(|(key, _)| key.value == value)
-            .flat_map(|(key, facts)| facts.iter().cloned().map(|fact| (key.path.clone(), fact)))
+            .get(&value)
+            .into_iter()
+            .flatten()
+            .flat_map(|(path, facts)| facts.iter().cloned().map(|fact| (path.clone(), fact)))
             .collect()
     }
 
@@ -268,6 +276,20 @@ pub(super) fn local_cell_is_closed(ctx: &Context, root: Value) -> bool {
     true
 }
 
+/// [`local_cell_is_closed`] answers for one pass over a scope. Each answer
+/// walks every use of its cell, and every load and store of the cell asks.
+#[derive(Default)]
+struct ClosedCells(HashMap<Value, bool>);
+
+impl ClosedCells {
+    fn contains(&mut self, ctx: &Context, root: Value) -> bool {
+        *self
+            .0
+            .entry(root)
+            .or_insert_with(|| local_cell_is_closed(ctx, root))
+    }
+}
+
 /// Propagate semantic facts through the exact ordinary SSA adapters that can
 /// remain after common CuTe preparation.  This is deliberately a monotone
 /// fixed-point transfer: loop block arguments become known once their entry
@@ -283,6 +305,7 @@ where
 {
     let mut changed = false;
     let mut blocks = HashSet::new();
+    let mut closed_cells = ClosedCells::default();
     for operation in operations {
         let operation_ref = operation.deref(ctx);
         if let Some(block) = operation_ref.get_parent_block() {
@@ -341,7 +364,7 @@ where
             let store = MirStoreOp::new(*operation);
             if !store.is_volatile(ctx)
                 && let Some((root, path)) = local_cell(ctx, store.address_opd(ctx))
-                && local_cell_is_closed(ctx, root)
+                && closed_cells.contains(ctx, root)
             {
                 changed |= facts.copy_entries(store.value_opd(ctx), root, &[], &path);
             }
@@ -352,7 +375,7 @@ where
             let load = MirLoadOp::new(*operation);
             if !load.is_volatile(ctx)
                 && let Some((root, path)) = local_cell(ctx, load.address_opd(ctx))
-                && local_cell_is_closed(ctx, root)
+                && closed_cells.contains(ctx, root)
             {
                 changed |= facts.copy_entries(root, operation_ref.get_result(0), &path, &[]);
             }
@@ -475,6 +498,7 @@ where
 {
     let mut changed = false;
     let mut blocks = HashSet::new();
+    let mut closed_cells = ClosedCells::default();
     for operation in operations {
         if let Some(block) = operation.deref(ctx).get_parent_block() {
             blocks.insert(block);
@@ -486,7 +510,7 @@ where
         let Some((root, cell_path)) = local_cell(ctx, store.address_opd(ctx)) else {
             continue;
         };
-        if !local_cell_is_closed(ctx, root) {
+        if !closed_cells.contains(ctx, root) {
             continue;
         }
         for (path, _) in facts.entries(root) {

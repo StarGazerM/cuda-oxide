@@ -261,7 +261,7 @@ fn mem2reg_salvages_tagged_alloca_into_mir_dbg_value() {
     append_mir_return(&mut ctx, block, vec![loaded]);
 
     let mut analyses = pliron::pass::AnalysisManager::default();
-    pliron::opts::mem2reg::mem2reg(module_ptr, &mut ctx, &mut analyses)
+    mir_transforms::mem2reg::mem2reg(module_ptr, &mut ctx, &mut analyses)
         .expect("mem2reg should promote the local slot");
 
     let blocks = vec![block];
@@ -365,7 +365,7 @@ fn mem2reg_salvages_fragment_only_alloca_into_mir_dbg_value() {
     append_mir_return(&mut ctx, block, vec![loaded]);
 
     let mut analyses = pliron::pass::AnalysisManager::default();
-    pliron::opts::mem2reg::mem2reg(module_ptr, &mut ctx, &mut analyses)
+    mir_transforms::mem2reg::mem2reg(module_ptr, &mut ctx, &mut analyses)
         .expect("mem2reg should promote fragment storage");
 
     let dbg_values = find_all::<mir::MirDbgValueOp>(&ctx, &[block]);

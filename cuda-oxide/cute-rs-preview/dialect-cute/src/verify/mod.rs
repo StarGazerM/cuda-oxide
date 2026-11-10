@@ -60,7 +60,7 @@ use pliron::{
     common_traits::Verify,
     context::{Context, Ptr},
     linked_list::ContainsLinkedList,
-    op::Op,
+    op::{Op, OpId},
     operation::Operation,
 };
 use scheduler::verify_scheduler_story;
@@ -126,6 +126,17 @@ type Result<T = ()> = VerifyResult<T>;
 /// Wrap a semantic contract failure in the shared invalid-module error variant.
 fn invalid(message: impl Into<String>) -> VerifyError {
     VerifyError::Invalid(message.into())
+}
+
+/// Whether a scope holds any operation of one semantic family.
+///
+/// The scheduler, pipeline, and shared-MMA checks all start from their own
+/// family's operations, so a scope without any passes them. They test this
+/// first because their provenance analysis visits every value of the scope.
+fn scope_has_any(ctx: &Context, operations: &[Ptr<Operation>], family: &[OpId]) -> bool {
+    operations
+        .iter()
+        .any(|operation| family.contains(&Operation::get_opid(*operation, ctx)))
 }
 
 /// Visit the root and all nested operations in region/block order without changing the IR.

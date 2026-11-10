@@ -96,7 +96,7 @@ Stage by stage:
    `mir-importer` translates Stable MIR into `dialect-mir` -- a pliron
    dialect that models Rust MIR semantics (places, projections, `Rvalue`,
    `BinOp`, etc.). The initial form uses per-local `mir.alloca` slots with
-   `mir.load`/`mir.store` for cross-block data flow; `pliron::opts::mem2reg`
+   `mir.load`/`mir.store` for cross-block data flow; `mir_transforms::mem2reg`
    then promotes those slots back into SSA values.
    [Compiler optimizations](compiler-optimizations.md), beginning with
    annotated loop unrolling, run on that SSA form before lowering.

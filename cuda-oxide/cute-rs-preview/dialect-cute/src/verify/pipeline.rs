@@ -24,6 +24,7 @@ use super::{
         OrdinaryFacts, poison_missing_forwarding_sources, propagate_ordinary_plumbing,
         seed_unknown_integer_carriers,
     },
+    scope_has_any,
 };
 use crate::{
     attributes::{CutePipelineRoleAttr, CutePipelineStateAttr},
@@ -302,6 +303,9 @@ pub(super) fn require_producer_pipeline_order(
 /// Validate handle ownership, complete cursor lifecycles, CFG order, and expected TMA byte totals.
 pub(super) fn verify_pipeline_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -> Result {
     let ids = pipeline_semantic_ids();
+    if !scope_has_any(ctx, all_ops, &ids) {
+        return Ok(());
+    }
     let facts = build_pipeline_facts(ctx, all_ops);
     let makes: Vec<_> = all_ops
         .iter()

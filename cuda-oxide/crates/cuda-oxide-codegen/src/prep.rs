@@ -142,7 +142,7 @@ pub fn prepare_mir_module(
         module,
         "module post-borrowed-aggregate-read-canonicalization",
     )?;
-    pliron::opts::mem2reg::mem2reg(module, ctx, &mut analyses).map_err(|error| {
+    mir_transforms::mem2reg::mem2reg(module, ctx, &mut analyses).map_err(|error| {
         PipelineError::Verification {
             name: "mem2reg".to_string(),
             message: error.disp(ctx).to_string(),
@@ -208,7 +208,7 @@ pub fn prepare_mir_module(
         // the only reason another tensor slot looked as though its address
         // escaped. That newly exposed inner slot is promotable only after the
         // pointer cleanup above, so give this tensor pipeline one more pass.
-        pliron::opts::mem2reg::mem2reg(module, ctx, &mut analyses).map_err(|error| {
+        mir_transforms::mem2reg::mem2reg(module, ctx, &mut analyses).map_err(|error| {
             PipelineError::Verification {
                 name: "second mem2reg".to_string(),
                 message: error.disp(ctx).to_string(),

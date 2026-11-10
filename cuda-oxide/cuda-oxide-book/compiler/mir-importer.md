@@ -7,7 +7,7 @@ takes the Stable MIR that rustc hands us and translates it into
 `dialect-mir`, the pliron dialect that preserves Rust semantics. The
 translator initially emits an alloca/load/store form -- cheap to produce,
 easy to reason about, and a pliron identity on input. A subsequent
-`pliron::opts::mem2reg` pass promotes those slots back into SSA form. cuda-oxide
+`mir_transforms::mem2reg` pass promotes those slots back into SSA form. cuda-oxide
 then runs its [compiler optimizations](compiler-optimizations.md), beginning
 with annotated loop unrolling, before lowering to the LLVM dialect.
 
@@ -33,7 +33,7 @@ structs and a `PipelineConfig`, then runs these stages:
 ```text
 Step 1:  Translate Rust MIR → `dialect-mir`
 Step 2:  Verify `dialect-mir` module
-Step 3:  Run `pliron::opts::mem2reg` to promote alloca slots back into SSA
+Step 3:  Run `mir_transforms::mem2reg` to promote alloca slots back into SSA
 Step 4:  Apply `dialect-mir` optimizations (currently annotated loop unrolling)
 Step 5:  Lower `dialect-mir` → LLVM dialect (via mir-lower)
 Step 6:  For NVVM builds, adjust the LLVM dialect via nvvm-transforms
@@ -71,7 +71,7 @@ For each function, the pipeline:
 3. Runs pliron's verifier on the module to catch structural errors early --
    mismatched types, missing operands, broken dominance -- before they turn
    into cryptic LLVM failures downstream.
-4. Runs `pliron::opts::mem2reg` to promote the alloca slots back into SSA
+4. Runs `mir_transforms::mem2reg` to promote the alloca slots back into SSA
    values within `dialect-mir`.
 5. Runs [compiler optimizations](compiler-optimizations.md), currently
    unrolling supported loops carrying `#[unroll]` or `#[unroll(N)]` requests.
@@ -166,8 +166,9 @@ We resolve this tension in two phases:
    is **argument-less**: all cross-block data flow travels through the
    alloca slots, not through block arguments.
 
-2. **`pliron::opts::mem2reg`: slots → SSA.** After the `dialect-mir` module
-   verifies, `pipeline.rs` runs pliron's built-in `mem2reg` pass. It
+2. **`mir_transforms::mem2reg`: slots → SSA.** After the `dialect-mir` module
+   verifies, `prep.rs` runs the `mem2reg` pass (pliron's algorithm and
+   promotion interfaces, with indexed lookups for large functions). It
    promotes every eligible alloca back into SSA values, rewiring each load
    to the reaching definition and inserting block arguments (the pliron
    spelling of phi nodes) wherever a value merges along multiple control
@@ -197,7 +198,7 @@ The importer first emits this alloca-based `dialect-mir` (before `mem2reg`):
   mir.return %r : i32
 ```
 
-After `pliron::opts::mem2reg` has promoted `%s1`, the same function becomes
+After `mir_transforms::mem2reg` has promoted `%s1`, the same function becomes
 SSA-form `dialect-mir`, with block arguments appearing only where they are
 actually needed to merge reaching definitions:
 
@@ -408,7 +409,7 @@ pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 ```
 
 After `mir-importer` translates the Stable MIR into `dialect-mir` (and
-`pliron::opts::mem2reg` has promoted the alloca slots back into SSA), the
+`mir_transforms::mem2reg` has promoted the alloca slots back into SSA), the
 result looks something like this (simplified, with many details elided for
 clarity):
 
@@ -444,7 +445,7 @@ A few things to notice:
 - **Block arguments** are absent here. Remember that `mir-importer` itself
   emits *every* branch terminator with zero operands and every non-entry
   block argument-less -- values cross block boundaries through alloca slots
-  until `pliron::opts::mem2reg` runs. In this function, `mem2reg` can see
+  until `mir_transforms::mem2reg` runs. In this function, `mem2reg` can see
   that nothing needs to merge at `^compute` or `^exit` (no values survive
   across the branch), so it promotes the slots away without introducing any
   block arguments. A loopier kernel with values that live across a back

@@ -74,7 +74,7 @@
 //! Every non-ZST MIR local is materialised as a single `mir.alloca` emitted
 //! at the top of the function's entry block. Defs lower to `mir.store`, uses
 //! lower to `mir.load`. Cross-block data flow happens through the slots, so
-//! blocks (other than the entry) take no arguments. Pliron's `mem2reg` pass
+//! blocks (other than the entry) take no arguments. The `mem2reg` pass
 //! promotes the slots back into SSA before the `dialect-mir` → LLVM dialect
 //! lowering runs.
 

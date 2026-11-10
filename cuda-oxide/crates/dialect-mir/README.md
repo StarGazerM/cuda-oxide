@@ -237,7 +237,7 @@ Pointers carry an NVPTX address space independently of their source kind:
 | `call`         | 1   | function calls                                                                                           |
 | `debug`        | 1   | dbg_value -- binds a value to a source-level variable                                                    |
 
-`MirAllocaOp` implements `PromotableAllocationInterface` and `MirLoadOp` / `MirStoreOp` implement `PromotableOpInterface`, so pliron's `mem2reg` pass can promote scalar stack slots back into SSA. `MirUndefOp` is the default reaching definition the pass materialises when a load is not dominated by any store.
+`MirAllocaOp` implements pliron's `PromotableAllocationInterface` and `MirLoadOp` / `MirStoreOp` implement `PromotableOpInterface`, so the `mem2reg` pass (`mir_transforms::mem2reg`) can promote scalar stack slots back into SSA. `MirUndefOp` is the default reaching definition the pass materialises when a load is not dominated by any store.
 
 ## Verification
 

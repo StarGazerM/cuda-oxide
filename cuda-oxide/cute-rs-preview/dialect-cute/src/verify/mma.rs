@@ -23,10 +23,11 @@ use super::{
     ghosts::smem_mma_semantic_ids,
     invalid,
     provenance::{
-        CarrierKey, OrdinaryFacts, branch_successor_operands, is_semantic_pointer_carrier_cast,
-        local_cell, local_cell_is_closed, poison_missing_forwarding_sources,
-        propagate_ordinary_plumbing, seed_unknown_integer_carriers,
+        OrdinaryFacts, branch_successor_operands, is_semantic_pointer_carrier_cast, local_cell,
+        local_cell_is_closed, poison_missing_forwarding_sources, propagate_ordinary_plumbing,
+        seed_unknown_integer_carriers,
     },
+    scope_has_any,
 };
 use crate::{
     attributes::CuteTiledMmaPlanAttr,
@@ -360,7 +361,8 @@ fn mma_branch_forwards_fact(
 fn mma_ordinary_use_forwards_fact(
     ctx: &Context,
     facts: &OrdinaryFacts<MmaFact>,
-    key: &CarrierKey,
+    value: Value,
+    path: &[u32],
     fact: MmaFact,
     user: Ptr<Operation>,
     operand_index: usize,
@@ -372,14 +374,14 @@ fn mma_ordinary_use_forwards_fact(
         && is_semantic_pointer_carrier_cast(ctx, user)
         && operation.get_num_results() == 1
     {
-        return mma_fact_at_path(facts, operation.get_result(0), &key.path, fact);
+        return mma_fact_at_path(facts, operation.get_result(0), path, fact);
     }
     if (opid == MirConstructStructOp::get_opid_static()
         || opid == MirConstructTupleOp::get_opid_static())
         && operation.get_num_results() == 1
     {
         let mut destination_path = vec![operand_index as u32];
-        destination_path.extend_from_slice(&key.path);
+        destination_path.extend_from_slice(path);
         return mma_fact_at_path(facts, operation.get_result(0), &destination_path, fact);
     }
     if opid == MirInsertFieldOp::get_opid_static()
@@ -390,14 +392,14 @@ fn mma_ordinary_use_forwards_fact(
             return false;
         };
         if operand_index == 0 {
-            if key.path.first().copied() == Some(index.0) {
+            if path.first().copied() == Some(index.0) {
                 return true;
             }
-            return mma_fact_at_path(facts, operation.get_result(0), &key.path, fact);
+            return mma_fact_at_path(facts, operation.get_result(0), path, fact);
         }
         if operand_index == 1 {
             let mut destination_path = vec![index.0];
-            destination_path.extend_from_slice(&key.path);
+            destination_path.extend_from_slice(path);
             return mma_fact_at_path(facts, operation.get_result(0), &destination_path, fact);
         }
         return false;
@@ -409,10 +411,10 @@ fn mma_ordinary_use_forwards_fact(
         let Some(index) = MirExtractFieldOp::new(user).get_attr_index(ctx) else {
             return false;
         };
-        if key.path.first().copied() != Some(index.0) {
+        if path.first().copied() != Some(index.0) {
             return true;
         }
-        return mma_fact_at_path(facts, operation.get_result(0), &key.path[1..], fact);
+        return mma_fact_at_path(facts, operation.get_result(0), &path[1..], fact);
     }
     if opid == MirStoreOp::get_opid_static() && operation.get_num_operands() == 2 {
         let store = MirStoreOp::new(user);
@@ -424,7 +426,7 @@ fn mma_ordinary_use_forwards_fact(
             && let Some((root, mut destination_path)) = local_cell(ctx, store.address_opd(ctx))
             && local_cell_is_closed(ctx, root)
         {
-            destination_path.extend_from_slice(&key.path);
+            destination_path.extend_from_slice(path);
             return mma_fact_at_path(facts, root, &destination_path, fact);
         }
         return false;
@@ -440,7 +442,7 @@ fn mma_ordinary_use_forwards_fact(
         if !local_cell_is_closed(ctx, root) {
             return false;
         }
-        let Some(result_path) = key.path.strip_prefix(cell_path.as_slice()) else {
+        let Some(result_path) = path.strip_prefix(cell_path.as_slice()) else {
             return true;
         };
         return mma_fact_at_path(facts, operation.get_result(0), result_path, fact);
@@ -458,7 +460,7 @@ fn mma_ordinary_use_forwards_fact(
     if opid == MirCondBranchOp::get_opid_static() && operand_index == 0 {
         return false;
     }
-    mma_branch_forwards_fact(ctx, facts, user, key.value, &key.path, fact)
+    mma_branch_forwards_fact(ctx, facts, user, value, path, fact)
 }
 
 /// Reject ordinary uses that discard or expose semantic MMA carriers outside recognized forwarding.
@@ -467,12 +469,12 @@ pub(super) fn verify_mma_use_closure(
     operations: &[Ptr<Operation>],
     facts: &OrdinaryFacts<MmaFact>,
 ) -> Result {
-    for (key, found) in &facts.facts {
+    for (value, path, found) in facts.iter() {
         for fact in found.iter().copied() {
             if matches!(fact, MmaFact::Scalar(_) | MmaFact::Unknown(_)) {
                 continue;
             }
-            for r#use in key.value.uses(ctx) {
+            for r#use in value.uses(ctx) {
                 let user = r#use.user_op();
                 let operand_index = r#use.find_index(ctx);
                 if operations.contains(&user)
@@ -480,7 +482,8 @@ pub(super) fn verify_mma_use_closure(
                         || mma_ordinary_use_forwards_fact(
                             ctx,
                             facts,
-                            key,
+                            value,
+                            path,
                             fact,
                             user,
                             operand_index,
@@ -518,6 +521,9 @@ fn require_same_mma_plan(
 /// Validate shared overlays, lazy B partitions, scale/A fragments, and accumulator provenance together.
 pub(super) fn verify_smem_mma_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -> Result {
     let ids = smem_mma_semantic_ids();
+    if !scope_has_any(ctx, all_ops, &ids) {
+        return Ok(());
+    }
     let facts = build_mma_facts(ctx, all_ops);
     let mut overlays = HashSet::new();
     let mut used_overlays = HashSet::new();
@@ -753,17 +759,6 @@ pub(super) fn verify_smem_mma_story(ctx: &Context, all_ops: &[Ptr<Operation>]) -
         }
     }
 
-    let found = overlays.len()
-        + slices.len()
-        + fills.len()
-        + scale_loads.len()
-        + scale_slices.len()
-        + a_loads.len()
-        + b_partitions.len()
-        + gemms;
-    if found == 0 {
-        return Ok(());
-    }
     verify_mma_use_closure(ctx, all_ops, &facts)?;
     if gemms == 0
         || overlays != used_overlays

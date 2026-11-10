@@ -2,11 +2,11 @@
 
 Optimization passes over the `dialect-mir` IR.
 
-These run in the middle of cuda-oxide's pipeline: after `mem2reg` has promoted
-memory slots to plain SSA values, and before the IR is lowered to the LLVM
-dialect on its way to PTX. Running here means a pass sees Rust-level structure
-— typed aggregates, slices, checked arithmetic — that is gone by the time LLVM
-IR exists.
+These run in the middle of cuda-oxide's pipeline: around `mem2reg`, which
+promotes memory slots to plain SSA values, and before the IR is lowered to the
+LLVM dialect on its way to PTX. Running here means a pass sees Rust-level
+structure — typed aggregates, slices, checked arithmetic — that is gone by the
+time LLVM IR exists.
 
 The first pass is loop unrolling, requested by the `#[unroll]` /
 `#[unroll(N)]` annotation, which the importer records as a `mir.unroll_hint`
@@ -23,3 +23,10 @@ projections into value operations (`mir.extract_field` plus
 for immutable aggregate pointer arguments with proven caller-private
 provenance after it; anything it cannot prove fails closed and keeps the
 memory access.
+
+`mem2reg.rs` is the promotion pass itself. It follows pliron's `mem2reg`
+algorithm and calls the same promotion interfaces in the same order, so its
+output is identical, but each load or store finds its slot through an index
+instead of being checked against every slot of the function. Promotion cost
+then no longer grows with slots × accesses, which matters for functions with
+hundreds of locals.

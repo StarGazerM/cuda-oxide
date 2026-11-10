@@ -35,7 +35,7 @@ variables remain in stable memory locations for cuda-gdb.
 2. **Verify** — Check type consistency and structural invariants on the
    `dialect-mir` module.
 3. **mem2reg** — Promote scalar alloca slots back to SSA via
-   `pliron::opts::mem2reg`, eliminating the load/store traffic the translator
+   `mir_transforms::mem2reg`, eliminating the load/store traffic the translator
    produced.
 4. **Unroll** — Apply supported `#[unroll]` and `#[unroll(N)]` requests to the
    SSA form.

@@ -387,7 +387,7 @@ the results of `mir.load`s from each operand's alloca slot, or
 before inserting the NVVM operation. The result is written through that
 prepared destination afterward, so dynamic projections are not re-evaluated
 after the intrinsic executes. (These are not SSA values yet;
-`pliron::opts::mem2reg` will collapse the load/store chains once translation
+`mir_transforms::mem2reg` will collapse the load/store chains once translation
 is complete.) For a catalog intrinsic you never write any of this:
 `cuda-intrinsics-gen` derives it from the resolved generated catalog.
 

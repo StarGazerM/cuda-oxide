@@ -87,6 +87,7 @@ use dialect_mir::{
     types::{MirArrayType, MirPointerKind, MirPtrType, MirStructType, address_space},
 };
 use pliron::{
+    basic_block::BasicBlock,
     builtin::op_interfaces::SymbolOpInterface,
     builtin::types::{IntegerType, Signedness},
     context::{Context, Ptr},
@@ -101,6 +102,7 @@ use pliron::{
     r#type::{TypeHandle, Typed},
     value::Value,
 };
+use rustc_hash::FxHashMap;
 
 #[derive(Clone)]
 struct LoadRewrite {
@@ -139,9 +141,10 @@ pub fn canonicalize_read_only_aggregate_arguments(
         .filter(|op| Operation::get_op::<MirAllocaOp>(*op, ctx).is_some())
         .collect();
 
+    let mut block_order = BlockOrderCache::default();
     let mut rewritten_loads = 0usize;
     for alloca in allocas {
-        let snapshot_reads = rewrite_entry_snapshot(ctx, alloca);
+        let snapshot_reads = rewrite_entry_snapshot(ctx, alloca, &mut block_order);
         rewritten_loads += snapshot_reads;
         if snapshot_reads != 0 {
             continue;
@@ -149,11 +152,47 @@ pub fn canonicalize_read_only_aggregate_arguments(
         let Some(plan) = analyze_alloca(ctx, alloca) else {
             continue;
         };
-        rewritten_loads += rewrite_plan(ctx, plan);
+        rewritten_loads += rewrite_plan(ctx, plan, &mut block_order);
     }
 
     if rewritten_loads > 0 && verbose {
         eprintln!("borrowed-aggregate scalarization: rewrote {rewritten_loads} dynamic load(s)");
+    }
+}
+
+/// Operation positions within a block, built on first use.
+///
+/// The snapshot proof asks whether each pointer user follows the initializing
+/// store in the same block. An entry block holds one slot per MIR local, so
+/// the order is shared by every slot in the block and dropped only when a
+/// rewrite edits that block.
+#[derive(Default)]
+struct BlockOrderCache {
+    blocks: FxHashMap<Ptr<BasicBlock>, FxHashMap<Ptr<Operation>, usize>>,
+}
+
+impl BlockOrderCache {
+    fn positions(
+        &mut self,
+        ctx: &Context,
+        block: Ptr<BasicBlock>,
+    ) -> &FxHashMap<Ptr<Operation>, usize> {
+        self.blocks.entry(block).or_insert_with(|| {
+            block
+                .deref(ctx)
+                .iter(ctx)
+                .enumerate()
+                .map(|(position, operation)| (operation, position))
+                .collect()
+        })
+    }
+
+    /// Forget the order of the block holding `operation`. Call this before
+    /// inserting next to or erasing `operation`.
+    fn invalidate_block_of(&mut self, ctx: &Context, operation: Ptr<Operation>) {
+        if let Some(block) = operation.deref(ctx).get_parent_block() {
+            self.blocks.remove(&block);
+        }
     }
 }
 
@@ -167,7 +206,11 @@ enum SnapshotProjection {
 /// must stay in the initializer block, after its unique store, and the entire
 /// pointer-use graph must consist of projections and nonvolatile reads. This
 /// cannot widen reads from shared/global memory or allow a pointer to escape.
-fn rewrite_entry_snapshot(ctx: &mut Context, alloca: Ptr<Operation>) -> usize {
+fn rewrite_entry_snapshot(
+    ctx: &mut Context,
+    alloca: Ptr<Operation>,
+    block_order: &mut BlockOrderCache,
+) -> usize {
     fn argument_root(ctx: &Context, value: Value, args: &[Value]) -> bool {
         if args.contains(&value) {
             return true;
@@ -187,7 +230,7 @@ fn rewrite_entry_snapshot(ctx: &mut Context, alloca: Ptr<Operation>) -> usize {
         ctx: &Context,
         pointer: Value,
         initializer: Ptr<Operation>,
-        positions: &HashMap<Ptr<Operation>, usize>,
+        positions: &FxHashMap<Ptr<Operation>, usize>,
         path: &[SnapshotProjection],
         reads: &mut Vec<Read>,
         projections: &mut Vec<Ptr<Operation>>,
@@ -244,12 +287,6 @@ fn rewrite_entry_snapshot(ctx: &mut Context, alloca: Ptr<Operation>) -> usize {
     let Some(block) = alloca.deref(ctx).get_parent_block() else {
         return 0;
     };
-    let positions: HashMap<_, _> = block
-        .deref(ctx)
-        .iter(ctx)
-        .enumerate()
-        .map(|(i, o)| (o, i))
-        .collect();
     let args: Vec<_> = block.deref(ctx).arguments().collect();
     let root = alloca.deref(ctx).get_result(0);
     let stores: Vec<_> = root
@@ -261,7 +298,9 @@ fn rewrite_entry_snapshot(ctx: &mut Context, alloca: Ptr<Operation>) -> usize {
         return 0;
     }
     let initializer = stores[0].get_operation();
-    if !positions.contains_key(&initializer) || initializer.deref(ctx).get_operand(0) != root {
+    if initializer.deref(ctx).get_parent_block() != Some(block)
+        || initializer.deref(ctx).get_operand(0) != root
+    {
         return 0;
     }
     let value = stores[0].value_opd(ctx);
@@ -274,7 +313,7 @@ fn rewrite_entry_snapshot(ctx: &mut Context, alloca: Ptr<Operation>) -> usize {
         ctx,
         root,
         initializer,
-        &positions,
+        block_order.positions(ctx, block),
         &[],
         &mut reads,
         &mut projections,
@@ -282,6 +321,11 @@ fn rewrite_entry_snapshot(ctx: &mut Context, alloca: Ptr<Operation>) -> usize {
     .is_none()
     {
         return 0;
+    }
+    // Every read and projection was proven to sit in `block`, so this is the
+    // only block the rewrite below edits.
+    if !reads.is_empty() || !projections.is_empty() {
+        block_order.invalidate_block_of(ctx, initializer);
     }
     let count = reads.len();
     let mut rewriter = IRRewriter::<Recorder>::default();
@@ -477,9 +521,19 @@ fn is_mutable_erased_alloca_projection(pointer: &MirPtrType) -> bool {
         && pointer.address_space == address_space::GENERIC
 }
 
-fn rewrite_plan(ctx: &mut Context, plan: AllocaPlan) -> usize {
+fn rewrite_plan(ctx: &mut Context, plan: AllocaPlan, block_order: &mut BlockOrderCache) -> usize {
     let load_count = plan.loads.len();
     let mut rewriter = IRRewriter::<Recorder>::default();
+
+    for edited in plan
+        .loads
+        .iter()
+        .map(|rewrite| rewrite.load)
+        .chain(plan.array_addrs.iter().copied())
+        .chain(plan.field_addrs.iter().copied())
+    {
+        block_order.invalidate_block_of(ctx, edited);
+    }
 
     for rewrite in plan.loads {
         let location = rewrite.load.deref(ctx).loc().clone();
@@ -726,7 +780,7 @@ fn analyze_borrowed_pointer_read(
 fn bounded_pointer_index(
     ctx: &Context,
     index: Value,
-    load_block: Ptr<pliron::basic_block::BasicBlock>,
+    load_block: Ptr<BasicBlock>,
     array_size: u64,
 ) -> Option<BoundedPointerIndex> {
     let index_type = index.get_type(ctx);
